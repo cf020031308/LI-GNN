@@ -1,0 +1,32 @@
+#!/bin/bash -
+
+set -x
+
+args="--gpu 0 --runs 10 --split 0"
+for dataset in flickr pubmed; do
+    # MLP
+	time python3 -u main.pyc MLP $dataset $args --n-layers 3 2>&1
+    # GCN
+	time python3 -u main.pyc GCN $dataset $args 2>&1
+	time python3 -u main.pyc GCN $dataset $args --skip-connection 2>&1
+
+	# LPA
+	for rate in 0.1 0.2 0.3; do
+		time python3 -u main.pyc LPA $dataset $args --smooth 50 --smooth-rate $rate 2>&1
+	done
+	# C&S
+	time python3 -u main.pyc MLP $dataset $args --correct 50 --correct-rate 0.1 --smooth 50 --smooth-rate 0.1 2>&1
+	# Label Input & Reuse
+	for use in 0 1 3 5; do
+		time python3 -u main.pyc GCN $dataset $args --label-input 0.5 --label-reuse $use 2>&1
+	done
+
+    # IGNN
+	time python3 -u main.pyc IGNN $dataset $args 2>&1
+    # EIGNN
+	time python3 -u main.pyc EIGNN $dataset $args 2>&1
+    # GQN
+    time python3 -u main.pyc GQN $dataset $args --label-input 0.5 2>&1
+    time python3 -u main.pyc GQN $dataset $args --skip-connection --label-input 0.5 2>&1
+done | tee -a logs/$0.log
+date
