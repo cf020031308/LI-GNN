@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import datetime
 import argparse
 
@@ -11,7 +12,6 @@ from dgl import data as dgl_data
 from torch_geometric import datasets as pyg_data
 from ogb.nodeproppred import NodePropPredDataset
 from sklearn.metrics import f1_score
-from matplotlib import pyplot
 
 
 parser = argparse.ArgumentParser()
@@ -448,27 +448,17 @@ def load_data(name):
         print('guess is bidir:', is_bidir)
     n_labels = int(Y.max().item() + 1)
     is_multiclass = len(Y.shape) == 2
-    # Draw Label Transition Matrices
-    fn = 'dataset/labeltrans/%s.png' % args.dataset
+    # Save Label Transitional Matrices
+    fn = 'dataset/labeltrans/%s.json' % args.dataset
     if not (is_multiclass or os.path.exists(fn)):
-        mesh = coo(
-            Y[E], torch.ones(E.shape[1]), size=(n_labels, n_labels)).to_dense()
-        den = mesh.sum(dim=1, keepdim=True)
-        mesh /= den
-        mesh[den.squeeze(1) == 0] = 0
-        fig, ax = pyplot.subplots(1, 1, figsize=(4, 4))
-        im = ax.imshow(mesh, cmap='YlGn')
-        data = im.get_array()
-        thres = im.norm(data.max()) / 2
-        for i in range(n_labels):
-            for j in range(n_labels):
-                ax.text(
-                    j, i, round(data[i, j], 2),
-                    ha='center', va='center', size=45 // n_labels,
-                    color=['black', 'white'][int(im.norm(data[i, j]) > thres)])
-        ax.set_title(args.dataset, size=16)
-        fig.tight_layout()
-        pyplot.savefig(fn)
+        with open(fn, 'w') as file:
+            mesh = coo(
+                Y[E], torch.ones(E.shape[1]), size=(n_labels, n_labels)
+            ).to_dense()
+            den = mesh.sum(dim=1, keepdim=True)
+            mesh /= den
+            mesh[den.squeeze(1) == 0] = 0
+            json.dump(mesh.tolist(), file)
     if not args.asymmetric:
         # Remove Self-Loops
         E = E[:, E[0] != E[1]]
