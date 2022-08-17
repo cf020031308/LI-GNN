@@ -45,16 +45,16 @@ parser.add_argument(
           ' Set to 0 to use default split (if any). Default: 0.6'))
 parser.add_argument(
     '--correct', type=int, default=0,
-    help='Iterations for correcting after prediction. Default: 0')
+    help='Iterations for Correct after prediction. Default: 0')
 parser.add_argument(
     '--correct-rate', type=float, default=0.1,
-    help='Propagation rate for correcting after prediction. Default: 0.1')
+    help='Propagation rate for Correct after prediction. Default: 0.1')
 parser.add_argument(
     '--smooth', type=int, default=0,
-    help='Iterations for smoothing after prediction. Default: 0')
+    help='Iterations for Smooth after prediction. Default: 0')
 parser.add_argument(
     '--smooth-rate', type=float, default=0.1,
-    help='Propagation rate for smoothing after prediction. Default: 0.1')
+    help='Propagation rate for Smooth after prediction. Default: 0.1')
 parser.add_argument(
     '--no-self-loops', action='store_true',
     help='Add self loops. Default: yes')
@@ -63,23 +63,23 @@ parser.add_argument(
     help='Treat the graph as directional (if it is). Default: symmetric')
 parser.add_argument(
     '--early-stop-epochs', type=int, default=100,
-    help='Maximum epochs until stop when performance decreasing. Default: 100')
+    help='Maximum epochs until stop when accuracy decreasing. Default: 100')
 parser.add_argument(
     '--max-epochs', type=int, default=1000,
     help='Maximum epochs. Default: 1000')
 parser.add_argument(
     '--skip-connection', action='store_true',
-    help='Enable skip connections. Default: disabled')
+    help='Enable skip connections (a.k.a. linear layer). Default: disabled')
 parser.add_argument(
     '--attention', type=int, default=0,
     help='Number of attention heads. Default: 0')
 parser.add_argument(
     '--noise', type=float, default=0.0,
-    help='Input additional noise for uniqueness of the fixed point. Default: 0'
+    help='Weight of standalone noise inputted for regularization. Default: 0'
 )
 parser.add_argument(
     '--drop-state', type=float, default=0.0,
-    help='Dropout rate for inputted state. Default: 0')
+    help='Dropout probability for inputted state. Default: 0')
 args = parser.parse_args()
 # TODO: Attention cannot be used with asymmetric=True
 if args.attention or args.method not in ('GCN', 'GQN'):
