@@ -542,8 +542,8 @@ class Stat(object):
         test_y = y[test_mask]
         if is_multiclass:
             self.scores.append([
-                get_score(Y[valid_mask], valid_y > 0.5),
-                get_score(Y[test_mask], test_y > 0.5)])
+                get_score(Y[valid_mask], valid_y > 0),
+                get_score(Y[test_mask], test_y > 0)])
         else:
             self.scores.append([
                 get_score(Y[valid_mask], valid_y.argmax(dim=1)),
@@ -818,7 +818,7 @@ for run in range(args.runs):
             ev.record_training(opt.elapsed)
             if ev.evaluate_result(sg(Z)):
                 break
-    elif args.method == 'GQN':
+    elif args.method == 'GQN' and args.label_input:
         net = Net(
             n_features + n_labels, args.hidden, n_labels,
             A=A, AT=AT, **args.__dict__)
@@ -844,12 +844,11 @@ for run in range(args.runs):
                 # Back Propagate through the softmax activator
                 history.grad *= history.data * (1 - history.data)
                 if args.noise:
-                    r = torch.rand(history.shape).to(X.device)
-                    if not is_multiclass:
-                        r = F.normalize(r, p=1)
+                    r = sg(torch.randn(history.shape).to(X.device))
                     Zr = net(torch.cat((X, r), dim=1))
-                    (args.noise * criterion(
-                        Zr[rec_mask], Y[rec_mask]).mean()).backward()
+                    # TODO: for single-label classification only
+                    kl = (-F.log_softmax(Zr, dim=1) * history.data).sum(dim=1)
+                    (args.noise * kl.mean()).backward()
             ev.record_training(opt.elapsed)
             # NOTE: for convenience and efficiency, all methods except MLP
             # reuse output in training for evaluation
@@ -860,9 +859,56 @@ for run in range(args.runs):
                         ~train_mask].sum().item()
                     print('fixed point SE:', steady_se)
                     if not args.noise:
-                        r = torch.rand(history.shape).to(X.device)
-                        if not is_multiclass:
-                            r = F.normalize(r, p=1)
+                        r = sg(torch.randn(history.shape).to(X.device))
+                        Zr = net(torch.cat((X, r), dim=1))
+                    unsteady_se = ((r - Zr) ** 2)[~train_mask].sum().item()
+                    print('unsteady point SE:', unsteady_se)
+                break
+            history.data = sg(Z.detach())
+    elif args.method == 'GQN':
+        net = gpu(nn.Sequential(
+            Net(
+                n_features + args.hidden, args.hidden, args.hidden,
+                A=A, AT=AT, **args.__dict__),
+            nn.LayerNorm(args.hidden),
+            nn.Tanh(),
+        ))
+        clf = gpu(nn.Sequential(
+            nn.Dropout(args.dropout),
+            nn.Linear(args.hidden, n_labels)))
+        opt = Optim([*net.parameters(), *clf.parameters()])
+        history = torch.zeros((n_nodes, args.hidden)).to(
+            X.device).requires_grad_(True)
+        history.grad = history.data * 0
+        for epoch in range(1, 1 + args.max_epochs):
+            with opt:
+                if args.drop_state:
+                    history.data = F.dropout(history.data, p=args.drop_state)
+                Z = net(torch.cat((X, history), dim=1))
+                history_grad, history.grad = history.grad, None
+                Z.register_hook(lambda grad: grad + history_grad)
+                y = clf(Z)
+                criterion(y[train_mask], Y[train_mask]).mean().backward()
+                if args.noise:
+                    r = torch.randn(history.shape).to(X.device)
+                    Zr = net(torch.cat((X, r), dim=1))
+                    yr = clf(Zr)
+                    # mse = (Zr - history.data).norm()
+                    # TODO: for single-label classification only
+                    kl = (-F.log_softmax(yr, dim=1) * sg(y.detach())
+                          ).sum(dim=1)
+                    (args.noise * kl.mean()).backward()
+            ev.record_training(opt.elapsed)
+            # NOTE: for convenience and efficiency, all methods except MLP
+            # reuse output in training for evaluation
+            # if ev.evaluate_model(net, history.data, n_labels):
+            if ev.evaluate_result(y):
+                with torch.no_grad():
+                    steady_se = ((history - sg(Z)) ** 2)[
+                        ~train_mask].sum().item()
+                    print('fixed point SE:', steady_se)
+                    if not args.noise:
+                        r = sg(torch.randn(history.shape).to(X.device))
                         Zr = net(torch.cat((X, r), dim=1))
                     unsteady_se = ((r - Zr) ** 2)[~train_mask].sum().item()
                     print('unsteady point SE:', unsteady_se)
