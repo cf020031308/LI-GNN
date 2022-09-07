@@ -871,7 +871,7 @@ for run in range(args.runs):
                 n_features + args.hidden, args.hidden, args.hidden,
                 A=A, AT=AT, **args.__dict__),
             nn.LayerNorm(args.hidden),
-            nn.Tanh(),
+            nn.Sigmoid(),
         ))
         clf = gpu(nn.Sequential(
             nn.Dropout(args.dropout),
@@ -890,7 +890,7 @@ for run in range(args.runs):
                 y = clf(Z)
                 criterion(y[train_mask], Y[train_mask]).mean().backward()
                 if args.noise:
-                    r = torch.randn(history.shape).to(X.device)
+                    r = torch.rand(history.shape).to(X.device)
                     Zr = net(torch.cat((X, r), dim=1))
                     yr = clf(Zr)
                     # mse = (Zr - history.data).norm()
@@ -904,16 +904,16 @@ for run in range(args.runs):
             # if ev.evaluate_model(net, history.data, n_labels):
             if ev.evaluate_result(y):
                 with torch.no_grad():
-                    steady_se = ((history - sg(Z)) ** 2)[
+                    steady_se = ((history - Z) ** 2)[
                         ~train_mask].sum().item()
                     print('fixed point SE:', steady_se)
                     if not args.noise:
-                        r = sg(torch.randn(history.shape).to(X.device))
+                        r = torch.rand(history.shape).to(X.device)
                         Zr = net(torch.cat((X, r), dim=1))
                     unsteady_se = ((r - Zr) ** 2)[~train_mask].sum().item()
                     print('unsteady point SE:', unsteady_se)
                 break
-            history.data = sg(Z.detach())
+            history.data = Z.detach()
     else:
         opt = None
         y = torch.zeros((n_nodes, n_labels)).float().to(Y.device)
