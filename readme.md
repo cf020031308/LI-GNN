@@ -100,5 +100,13 @@ To run IGNN and EIGNN, you need to clone [this commit of EIGNN](https://github.c
 
 ## Citation
 
-```
+```bibtex
+@misc{luo2022unifying,
+      title={Unifying Label-inputted Graph Neural Networks with Deep Equilibrium Models}, 
+      author={Yi Luo and Guiduo Duan and Guangchun Luo and Aiguo Chen},
+      year={2022},
+      eprint={2211.10629},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
 ```
