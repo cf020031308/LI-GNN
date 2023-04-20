@@ -1,72 +1,65 @@
-# Graph Equilibrium Networks
+# Label-inputted Implicit Graph Neural Network (LI-GNN)
 
 This repo contains code that are required to reporduce all experiments in our paper *Graph Equilibrium Networks: Unifying Label-inputted Graph Neural Networks with Deep Equilibrium Models*.
 
 ## Paper Abstract
 
-For node classification, Graph Neural Networks (GNN) assign predefined labels to graph nodes according to node features propagated along the graph structure. Apart from the traditional end-to-end manner inherited from deep learning, many subsequent works input assigned labels into GNNs to improve their classification performance. Such label-inputted GNNs (LGNN) combine the advantages of learnable feature propagation and long-range label propagation, producing state-of-the-art performance on various benchmarks. However, the theoretical foundations of LGNNs are not well-established, and the combination is with seam because the long-range propagation is memory-consuming for optimization. To this end, this work interprets LGNNs with the theory of Implicit GNN (IGNN), which outputs a fixed state point of iterating its network infinite times and optimizes the infinite-range propagation with constant memory consumption. Besides, previous contributions to LGNNs inspire us to overcome the heavy computation in training IGNN by iterating the network only once but starting from historical states, which are randomly masked in forward-pass to implicitly guarantee the existence and uniqueness of the fixed point. Our improvements to IGNNs are network agnostic: for the first time, they are extended with complex networks and applied to large-scale graphs. Experiments on two synthetic and six realworld datasets verify the advantages of our method in terms of long-range dependencies capturing, label transitions modelling, accuracy, scalability, efficiency, and well-posedness.
+The success of Graph Neural Networks (GNN) in learning on non-Euclidean data arouses many subtopics, such as Label-inputted GNN (LGNN) and Implicit GNN (IGNN).
+LGNN, explicitly inputting supervising information in GNN, integrates label propagation to achieve superior performance, but with the dilemma between its propagating distance and adaptiveness.
+IGNN, outputting an equilibrium point by iterating its network infinite times, exploits information in the entire graph to capture long-range dependencies, but with its network constrained to guarantee the existence of the equilibrium.
+This work unifies the two subdomains by interpreting LGNN in the theory of IGNN and reducing prevailing LGNNs to forms of IGNN.
+The unification facilitates the exchange between the two subdomains and inspires more studies.
+Specifically, implicit differentiation of IGNN is introduced to LGNN to differentiate its infinite-range label propagation with constant memory, making the propagation both distant and adaptive.
+Besides, the masked label strategy of LGNN is proven able to guarantee the well-posedness of IGNN in a network-agnostic manner, granting its network more complex and thus more expressive.
+Combining the advantages of LGNN and IGNN, Label-inputted Implicit GNN is proposed.
+Node classification experiments on two synthesized and seven real-world datasets demonstrate its effectiveness.
 
 ## Usage
 
 ```
-usage: help.py [-h] [--hidden HIDDEN] [--runs RUNS] [--gpu GPU] [--lr LR]
-               [--dropout DROPOUT] [--n-layers N_LAYERS]
-               [--weight-decay WEIGHT_DECAY] [--label-input LABEL_INPUT]
-               [--label-reuse LABEL_REUSE] [--split SPLIT] [--correct CORRECT]
-               [--correct-rate CORRECT_RATE] [--smooth SMOOTH]
-               [--smooth-rate SMOOTH_RATE] [--no-self-loops] [--asymmetric]
-               [--early-stop-epochs EARLY_STOP_EPOCHS]
-               [--max-epochs MAX_EPOCHS] [--skip-connection]
-               [--attention ATTENTION] [--noise NOISE]
-               [--drop-state DROP_STATE]
-               method dataset
+usage: mai2.pyc [-h] [--runs RUNS] [--gpu GPU] [--split SPLIT] [--lr LR] [--dropout DROPOUT] [--n-layers N_LAYERS] [--weight-decay WEIGHT_DECAY]
+                [--early-stop-epochs EARLY_STOP_EPOCHS] [--max-epochs MAX_EPOCHS] [--hidden HIDDEN] [--heads HEADS] [--alpha ALPHA] [--theta THETA]
+                [--correct CORRECT] [--correct-rate CORRECT_RATE] [--smooth SMOOTH] [--smooth-rate SMOOTH_RATE] [--input-label INPUT_LABEL]
+                [--for-iter FOR_ITER] [--back-iter BACK_ITER] [--drop-state DROP_STATE] [--inductive]
+                method dataset
 
 positional arguments:
-  method                MLP | SGC | GCN | IGNN | EIGNN | GQN
-  dataset               cora | citeseer | pubmed | flickr | ppi | arxiv | yelp
-                        | reddit | ...
+  method                MLP | SGC | GCN | IGNN | EIGNN | GIN | SAGE | GAT | GCNII | JKNet
+  dataset               cora | citeseer | pubmed | flickr | arxiv | yelp | reddit | ...
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
-  --hidden HIDDEN       Dimension of hidden representations. Default: 64
   --runs RUNS           Default: 1
   --gpu GPU             Default: 0
+  --split SPLIT         Ratio of labels for training. Set to 0 to use default split (if any) or 0.6. With an integer x the dataset is splitted like
+                        Cora with the training set be composed by x samples per class. Default: 0
   --lr LR               Learning Rate. Default: 0.01
   --dropout DROPOUT     Default: 0
   --n-layers N_LAYERS   Default: 2
   --weight-decay WEIGHT_DECAY
                         Default: 0
-  --label-input LABEL_INPUT
-                        Ratio of known labels for input. Default: 0
-  --label-reuse LABEL_REUSE
-                        Iterations to produce pseudo labels for label input.
-                        Default: 0
-  --split SPLIT         Ratio of labels for training. Set to 0 to use default
-                        split (if any). Default: 0.6
-  --correct CORRECT     Iterations for Correct after prediction. Default: 0
-  --correct-rate CORRECT_RATE
-                        Propagation rate for Correct after prediction.
-                        Default: 0.1
-  --smooth SMOOTH       Iterations for Smooth after prediction. Default: 0
-  --smooth-rate SMOOTH_RATE
-                        Propagation rate for Smooth after prediction. Default:
-                        0.1
-  --no-self-loops       Add self loops. Default: yes
-  --asymmetric          Treat the graph as directional (if it is). Default:
-                        symmetric
   --early-stop-epochs EARLY_STOP_EPOCHS
-                        Maximum epochs until stop when accuracy decreasing.
-                        Default: 100
+                        Maximum epochs until stop when accuracy decreasing. Default: 100
   --max-epochs MAX_EPOCHS
                         Maximum epochs. Default: 1000
-  --skip-connection     Enable skip connections (a.k.a. linear layer).
-                        Default: disabled
-  --attention ATTENTION
-                        Number of attention heads. Default: 0
-  --noise NOISE         Weight of standalone noise inputted for
-                        regularization. Default: 0
+  --hidden HIDDEN       Dimension of hidden representations and implicit state. Default: 64
+  --heads HEADS         Number of attention heads for GAT. Default: 0
+  --alpha ALPHA         Hyperparameter for GCNII. Default: 0.5
+  --theta THETA         Hyperparameter for GCNII. Default: 1.0
+  --correct CORRECT     Iterations for Correct after prediction. Default: 0
+  --correct-rate CORRECT_RATE
+                        Propagation rate for Correct after prediction. Default: 0.1
+  --smooth SMOOTH       Iterations for Smooth after prediction. Default: 0
+  --smooth-rate SMOOTH_RATE
+                        Propagation rate for Smooth after prediction. Default: 0.1
+  --input-label INPUT_LABEL
+                        Ratio of known labels for input. Default: 0
+  --for-iter FOR_ITER   Iterations to produce state in forward-pass. Default: 0
+  --back-iter BACK_ITER
+                        Iterations to accumulate vjp in backward-pass. Default: 0
   --drop-state DROP_STATE
-                        Dropout probability for inputted state. Default: 0
+                        Ratio of state for dropping. Default: 0
+  --inductive           Enable the inductive setting
 ```
 
 For example, if you want to run MLP on the Cora dataset with its default split on gpu `cuda:3` for 5 runs, execute
@@ -79,22 +72,24 @@ python3 main.py MLP cora --split 0 --gpu 3 --runs 5
 
 Files in `scripts/` folder are scripts that reproduce experiments in our article.
 
-* `run_chain` runs experiment on the Chains dataset, producing data for Figure 2.
-* `run_weekday` runs experiment on the Weekday dataset, producing data for Figure 2.
-* `run_baseline` and `run_baseline_full` produces results in Table 2, reporting accuracy scores on the six datasets for GQN and baseline methods.
-* `run_ablation` runs GQN with different regularization methods. It produces the bar chart in Appendix of the article.
+* `run_baseline` runs experiments to produces accuracy scores for IGNN and SotA in Table 2
+* `run_chain` runs experiment on the Chains dataset, producing data for Figure 4.
+* `run_gcn` runs experiments to produce accuracy scores for GCN, C&S, Label Tricks, and LI-GNN in Table 2
+* `run_sota` runs experiments to produce accuracy scores for C&S, Label Tricks, and LI-GNN with SotA as their backbones in Table 2
+* `run_weekday` runs experiment on the Weekday dataset, producing data for Figure 3.
+* `run_wellpose` runs experiments to produce data for Figure 2.
 
 ## Datasets
 
 The Chain datasets are generated by code slightly modified from [IGNN](https://github.com/SwiftieH/IGNN).
 The Weekday dataset is generated by code from [3ference](https://github.com/cf020031308/3ference).
-Other datasets used in our paper, including Chameleon, Squirrel, Flickr, Pubmed, Amazon Photo, and Coauthor CS, are retrieved with [DGL](https://github.com/dmlc/dgl), [PyG](https://github.com/pyg-team/pytorch_geometric).
+Other datasets used in our paper, including Chameleon, Squirrel, Flickr, Pubmed, Amazon Photo, Coauthor CS, and etc, are retrieved with [DGL](https://github.com/dmlc/dgl) and [PyG](https://github.com/pyg-team/pytorch_geometric).
 
 Datasets that did not appear in our paper can also be retrieved by our code for further exploration, with the help of DGL, PyG, and [OGB](https://github.com/snap-stanford/ogb).
 
 ## Baselines
 
-We implement all methods except IGNN and EIGNN with PyTorch and Scikit-learn, if you want to run one of them, install PyTorch, Scikit-learn, DGL, PyG, and OGB first then execute `main.py`.
+We implement all methods except IGNN and EIGNN with PyTorch, PyG, and Scikit-learn, if you want to run one of them, install PyTorch, Scikit-learn, DGL, PyG, and OGB first then execute `main.py`.
 
 To run IGNN and EIGNN, you need to clone [this commit of EIGNN](https://github.com/liu-jc/EIGNN/tree//6a2c8e73c11bfebc8614d955226dbae600cc8dfc) (and install its dependencies) then place our `main.py` into the cloned folder.
 

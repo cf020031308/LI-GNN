@@ -1,0 +1,12 @@
+#!/bin/bash -
+
+set -x
+fn=$(basename "$0")
+
+for mask in 0.1 0.9 0.2 0.8 0.3 0.7 0.4 0.6 0.5; do
+    args="--runs 10"
+    for dataset in cora citeseer pubmed chameleon squirrel; do
+        time python3 -u main.pyc GCN $dataset $args --input-label 1 --drop-state $mask --for-iter 100 --back-iter 100 2>&1
+    done
+done | tee -a logs/$fn.log
+date

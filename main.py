@@ -1,12 +1,15 @@
 import os
 import time
 import json
+import copy
+import hashlib
 import datetime
 import argparse
 
 import psutil
 import torch
 import torch.nn as nn
+import torch_geometric.nn as gnn
 import torch.nn.functional as F
 from dgl import data as dgl_data
 from torch_geometric import datasets as pyg_data
@@ -16,16 +19,20 @@ from sklearn.metrics import f1_score
 
 parser = argparse.ArgumentParser()
 parser.add_argument('method', type=str, default='MLP', help=(
-    'MLP | SGC | GCN | IGNN | EIGNN | GQN'
+    'MLP | SGC | GCN | IGNN | EIGNN | GIN | SAGE | GAT | GCNII | JKNet'
 ))
 parser.add_argument('dataset', type=str, default='cora', help=(
-    'cora | citeseer | pubmed | flickr | ppi | arxiv | yelp | reddit | ...'
+    'cora | citeseer | pubmed | flickr | arxiv | yelp | reddit | ...'
 ))
-parser.add_argument(
-    '--hidden', type=int, default=64,
-    help='Dimension of hidden representations. Default: 64')
 parser.add_argument('--runs', type=int, default=1, help='Default: 1')
 parser.add_argument('--gpu', type=int, default=0, help='Default: 0')
+parser.add_argument(
+    '--split', type=float, default=0,
+    help=('Ratio of labels for training.'
+          ' Set to 0 to use default split (if any) or 0.6. '
+          ' With an integer x the dataset is splitted like Cora with the '
+          ' training set be composed by x samples per class. '
+          ' Default: 0'))
 parser.add_argument(
     '--lr', type=float, default=0.01, help='Learning Rate. Default: 0.01')
 parser.add_argument(
@@ -34,15 +41,23 @@ parser.add_argument('--n-layers', type=int, default=2, help='Default: 2')
 parser.add_argument(
     '--weight-decay', type=float, default=0.0, help='Default: 0')
 parser.add_argument(
-    '--label-input', type=float, default=0.0,
-    help='Ratio of known labels for input. Default: 0')
+    '--early-stop-epochs', type=int, default=100,
+    help='Maximum epochs until stop when accuracy decreasing. Default: 100')
 parser.add_argument(
-    '--label-reuse', type=int, default=0,
-    help='Iterations to produce pseudo labels for label input. Default: 0')
+    '--max-epochs', type=int, default=1000,
+    help='Maximum epochs. Default: 1000')
 parser.add_argument(
-    '--split', type=float, default=0.6,
-    help=('Ratio of labels for training.'
-          ' Set to 0 to use default split (if any). Default: 0.6'))
+    '--hidden', type=int, default=64,
+    help='Dimension of hidden representations and implicit state. Default: 64')
+parser.add_argument(
+    '--heads', type=int, default=1,
+    help='Number of attention heads for GAT. Default: 0')
+parser.add_argument(
+    '--alpha', type=float, default=0.5,
+    help='Hyperparameter for GCNII. Default: 0.5')
+parser.add_argument(
+    '--theta', type=float, default=1.0,
+    help='Hyperparameter for GCNII. Default: 1.0')
 parser.add_argument(
     '--correct', type=int, default=0,
     help='Iterations for Correct after prediction. Default: 0')
@@ -56,34 +71,25 @@ parser.add_argument(
     '--smooth-rate', type=float, default=0.1,
     help='Propagation rate for Smooth after prediction. Default: 0.1')
 parser.add_argument(
-    '--no-self-loops', action='store_true',
-    help='Add self loops. Default: yes')
+    '--input-label', type=float, default=0.0,
+    help='Ratio of known labels for input. Default: 0')
 parser.add_argument(
-    '--asymmetric', action='store_true',
-    help='Treat the graph as directional (if it is). Default: symmetric')
+    '--for-iter', type=int, default=0,
+    help='Iterations to produce state in forward-pass. Default: 0')
 parser.add_argument(
-    '--early-stop-epochs', type=int, default=100,
-    help='Maximum epochs until stop when accuracy decreasing. Default: 100')
-parser.add_argument(
-    '--max-epochs', type=int, default=1000,
-    help='Maximum epochs. Default: 1000')
-parser.add_argument(
-    '--skip-connection', action='store_true',
-    help='Enable skip connections (a.k.a. linear layer). Default: disabled')
-parser.add_argument(
-    '--attention', type=int, default=0,
-    help='Number of attention heads. Default: 0')
-parser.add_argument(
-    '--noise', type=float, default=0.0,
-    help='Weight of standalone noise inputted for regularization. Default: 0'
-)
+    '--back-iter', type=int, default=0,
+    help='Iterations to accumulate vjp in backward-pass. Default: 0')
 parser.add_argument(
     '--drop-state', type=float, default=0.0,
-    help='Dropout probability for inputted state. Default: 0')
+    help='Ratio of state for dropping. Default: 0')
+parser.add_argument(
+    '--inductive', action='store_true',
+    help='Enable the inductive setting')
 args = parser.parse_args()
-# TODO: Attention cannot be used with asymmetric=True
-if args.attention or args.method not in ('GCN', 'GQN'):
-    args.asymmetric = False
+
+inf = float('inf')
+exp = 0.1
+norm = lambda x: (x ** 2).mean() ** 0.5
 
 if not torch.cuda.is_available():
     args.gpu = -1
@@ -98,7 +104,6 @@ if args.gpu >= 0:
 coo = torch.sparse_coo_tensor
 get_score = lambda y_true, y_pred: f1_score(
     y_true.cpu(), y_pred.cpu(), average='micro').item()
-ce = lambda x, y: -F.logsigmoid((x * y).mean(dim=1)).mean()
 
 
 class Optim(object):
@@ -120,102 +125,45 @@ class Optim(object):
         self.elapsed = time.time() - self.elapsed
 
 
-def MLP(din, hid, dout, dropout=0, n_layers=2, attention=0, sym=True):
-    return nn.ModuleList([
-        gpu(nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(
-                (1 if sym else 2) * (
-                    din if i == 0 else ((attention or 1) * hid)),
-                (attention or 1) * (dout if i == n_layers - 1 else hid)),
-        )) for i in range(n_layers)
-    ])
-
-
-class Net(nn.Module):
-    def __init__(
-            self, din, hid, dout, dropout=0, n_layers=2,
-            skip_connection=False, A=None, AT=None, attention=0, **kwargs):
+class JKNet(nn.Module):
+    def __init__(self, din, dout, hidden, n_layers, dropout=0, **kw):
         super(self.__class__, self).__init__()
-        self.A = A
-        self.AT = AT
-        self.heads = attention
-        self.mlp = None
-        self.gnn = None
-        self.atts = None
-        if A is not None:
-            self.gnn = MLP(
-                din, hid, dout, dropout, n_layers, attention, AT is None)
-        if skip_connection or A is None:
-            self.mlp = MLP(din, hid, dout, dropout, n_layers, attention)
-        self.acts = nn.ModuleList([
-            gpu(nn.Identity() if i == n_layers - 1 else nn.Sequential(
-                nn.LayerNorm((attention or 1) * hid), nn.LeakyReLU()))
-            for i in range(n_layers)])
-        if attention:
-            self.atts = nn.ParameterList([
-                nn.Parameter(gpu(torch.rand(
-                    1, attention, 2 * (dout if i == n_layers - 1 else hid))))
-                for i in range(n_layers)])
+        self.convs = nn.ModuleList()
+        self.convs.append(gnn.GCNConv(din, hidden))
+        for _ in range(n_layers - 1):
+            self.convs.append(gnn.GCNConv(hidden, hidden))
+        self.lin = nn.Linear(hidden * n_layers, n_labels)
+        self.jk = gnn.JumpingKnowledge(mode='cat')
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        for i, act in enumerate(self.acts):
-            h = 0
-            if self.mlp is not None:
-                h = h + self.mlp[i](x)
-            if self.gnn is not None:
-                if self.atts is None:
-                    if self.AT is None:
-                        x = self.A @ x
-                    else:
-                        x = torch.cat((self.A @ x, self.AT @ x), dim=1)
-                    h = h + self.gnn[i](x)
-                else:
-                    # NOTE: Attention cannot be used with asymmetric=True
-                    x = self.gnn[i](x).view(x.shape[0], self.heads, -1)
-                    e = self.A._indices()
-                    s = torch.exp(F.leaky_relu(
-                        torch.cat(list(x[e]), dim=-1) * self.atts[i]
-                    ).mean(dim=-1))
-                    num = torch.zeros(x.shape).to(x.device)
-                    num.scatter_add_(
-                        0,
-                        e[0].view(-1, 1, 1).repeat(1, x.shape[1], x.shape[2]),
-                        x[e[1]] * s.unsqueeze(-1))
-                    den = torch.zeros(x.shape[:2]).to(x.device)
-                    den.scatter_add_(
-                        0, e[0].view(-1, 1).repeat(1, x.shape[1]), s)
-                    h = h + (num / den.unsqueeze(-1)).view(x.shape[0], -1)
-                    if i == len(self.acts) - 1:
-                        h = h.view(h.shape[0], self.heads, -1).mean(dim=1)
-            x = act(h)
-        return x
+    def forward(self, x, edge_index):
+        xs = []
+        for conv in self.convs:
+            x = F.relu(conv(self.dropout(x), edge_index))
+            xs.append(x)
+        return self.lin(self.jk(xs))
 
 
-def count_subgraphs(edges, n, mask=None):
-    subs = 0
-    props = 0
-    while n:
-        subs += 1
-        if mask is None:
-            mask = torch.zeros(n, dtype=bool).to(edges.device)
-            mask[0] = True
-        else:
-            mask = mask.clone()
-        src, dst = edges
-        flag = -1
-        while 1:
-            m = torch.cat((src[mask[dst]], dst[mask[src]])).unique()
-            mask[m] = True
-            props += 1
-            if flag == m.shape[0]:
-                break
-            flag = m.shape[0]
-        if mask.all():
-            return props, subs
-        nodes, edges = edges[:, ~mask[src]].unique(return_inverse=True)
-        n = nodes.shape[0]
-    return props, subs
+class GCNII(nn.Module):
+    def __init__(
+            self, din, dout, hidden, n_layers, dropout=0, **kw):
+        super(self.__class__, self).__init__()
+        self.lin1 = nn.Linear(din, hidden)
+        self.convs = nn.ModuleList([
+            gnn.GCN2Conv(
+                channels=hidden,
+                alpha=kw['alpha'],
+                theta=kw['theta'],
+                layer=i + 1,
+            ) for i in range(n_layers)])
+        self.lin2 = nn.Linear(hidden, dout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, edge_index):
+        x0 = x = F.relu(self.lin1(self.dropout(x)))
+        for conv in self.convs:
+            x = F.relu(conv(self.dropout(x), x0, edge_index))
+        return self.lin2(self.dropout(x))
 
 
 def load_data(name):
@@ -259,6 +207,7 @@ def load_data(name):
             dst = torch.cat([adj[:, i] for i in range(adj.shape[1])], dim=0)
             E = torch.cat((src.unsqueeze(0), dst.unsqueeze(0)))
             torch.save((X, Y, E), 'dataset/weekday.dat')
+        train_mask = None
     elif args.dataset.startswith('chain-'):
         """load the synthetic dataset: chain"""
         # https://github.com/SwiftieH/IGNN
@@ -284,6 +233,9 @@ def load_data(name):
         f = 100  # feature dimension
         n_nodes = c * n * lx
         tn = int(n_nodes * 0.05)  # train nodes
+        # NOTE: Our training nodes are fewer than that in EIGNN
+        # to keep label information sparse when the chain is long
+        tn = c * n
         vl = int(n_nodes * 0.1)  # val nodes
         tt = n_nodes - tn - vl  # test nodes
         ns = 0.00  # noise
@@ -459,17 +411,15 @@ def load_data(name):
             mesh /= den
             mesh[den.squeeze(1) == 0] = 0
             json.dump(mesh.tolist(), file)
-    if not args.asymmetric:
-        # Remove Self-Loops
-        E = E[:, E[0] != E[1]]
-        # Get Undirectional Edges
-        if not is_bidir:
-            E = torch.cat((E, E[[1, 0]]), dim=1)
-        # Add Self-Loops
-        if not args.no_self_loops:
-            E = torch.cat((
-                torch.arange(X.shape[0]).view(1, -1).repeat(2, 1), E), dim=1)
-    if args.split:
+    # Remove Self-Loops
+    E = E[:, E[0] != E[1]]
+    # Get Undirectional Edges
+    if not is_bidir:
+        E = torch.cat((E, E[[1, 0]]), dim=1)
+    if train_mask is None and not args.split:
+        args.split = 0.6
+    nrange = torch.arange(X.shape[0])
+    if 0 < args.split < 1:
         torch.manual_seed(42)  # the answer
         train_masks, valid_masks, test_masks = [], [], []
         for _ in range(args.runs):
@@ -487,13 +437,36 @@ def load_data(name):
                 test_mask[idx[val_num:val_num + test_num]] = True
             else:
                 for c in range(n_labels):
-                    label_idx = torch.arange(Y.shape[0])[Y == c]
+                    label_idx = nrange[Y == c]
                     val_num = test_num = int(
                         (1 - args.split) / 2 * label_idx.shape[0])
                     perm = label_idx[torch.randperm(label_idx.shape[0])]
                     train_mask[perm[val_num + test_num:]] = True
                     valid_mask[perm[:val_num]] = True
                     test_mask[perm[val_num:val_num + test_num]] = True
+    elif int(args.split):
+        # NOTE: work only for graphs with single labelled nodes.
+        torch.manual_seed(42)  # the answer
+        train_masks, valid_masks, test_masks = [], [], []
+        for _ in range(args.runs):
+            train_mask = torch.zeros(X.shape[0], dtype=bool)
+            for y in range(n_labels):
+                label_mask = Y == y
+                train_mask[
+                    nrange[label_mask][
+                        torch.randperm(label_mask.sum())[:int(args.split)]]
+                ] = True
+            valid_mask = ~train_mask
+            valid_mask[
+                nrange[valid_mask][torch.randperm(valid_mask.sum())[500:]]
+            ] = False
+            test_mask = ~(train_mask | valid_mask)
+            test_mask[
+                nrange[test_mask][torch.randperm(test_mask.sum())[1000:]]
+            ] = False
+            train_masks.append(train_mask)
+            valid_masks.append(valid_mask)
+            test_masks.append(test_mask)
     return X, Y, E, train_masks, valid_masks, test_masks, is_bidir
 
 
@@ -542,8 +515,8 @@ class Stat(object):
         test_y = y[test_mask]
         if is_multiclass:
             self.scores.append([
-                get_score(Y[valid_mask], valid_y > 0),
-                get_score(Y[test_mask], test_y > 0)])
+                get_score(Y[valid_mask], valid_y > 0.5),
+                get_score(Y[test_mask], test_y > 0.5)])
         else:
             self.scores.append([
                 get_score(Y[valid_mask], valid_y.argmax(dim=1)),
@@ -556,21 +529,6 @@ class Stat(object):
             self.best_acc = self.scores[-1][0]
             self.best_y = y
         return dec_epochs >= args.early_stop_epochs
-
-    def evaluate_model(self, model, history=None, n_labels=None, cbk=None):
-        with torch.no_grad():
-            model.eval()
-            t = time.time()
-            y = model(
-                X if history is None else torch.cat((X, history), dim=1))
-            if cbk is not None:
-                y = cbk(y)
-            if n_labels is not None:
-                y = y[:, :n_labels]
-            ev.record_evaluation(time.time() - t)
-            ret = self.evaluate_result(sg(y))
-        model.train()
-        return ret
 
     def end_run(self):
         print('val scores:', [s for s, _ in self.scores])
@@ -653,23 +611,26 @@ print('split: %d (%.2f%%) / %d (%.2f%%) / %d (%.2f%%)' % (
 print('intra_rate: %.2f%%' % (100 * (
     Y[E[0]] == Y[E[1]]).sum().float() / E.shape[1] / (
         n_labels if is_multiclass else 1)))
-print('subgraphs: %d' % count_subgraphs(E, n_nodes)[1])
-if not args.dataset.startswith('chain-'):
-    # Too slow
-    props = [count_subgraphs(E, n_nodes, m)[0] for m in train_masks]
-    print('longest distance from taining set: %s = %.2f' % (
-        props, sum(props) / len(train_masks)))
 
 if is_multiclass:
     _cri = nn.BCEWithLogitsLoss(reduction='none')
     criterion = lambda x, y: _cri(x, y).sum(dim=1)
     sg = torch.sigmoid
+    lsg = F.logsigmoid
+    thres_for = 1e-4 * 0.5
+    thres_back = 1e-5 * 0.25
 else:
     criterion = lambda x, y: F.cross_entropy(x, y, reduction='none')
     sg = lambda x: torch.softmax(x, dim=-1)
+    lsg = lambda x: F.log_softmax(x, dim=-1)
+    thres_for = 1e-4 / n_labels
+    thres_back = 1e-5 * (n_labels - 1) / n_labels / n_labels
 
 
 def norm_adj(edges, n, asym=False):
+    # Add Self-Loops
+    edges = torch.cat((
+        torch.arange(X.shape[0]).view(1, -1).repeat(2, 1), edges), dim=1)
     deg = torch.zeros(n).to(edges.device)
     deg.scatter_add_(
         dim=0, index=edges[0],
@@ -691,14 +652,13 @@ ev = Stat()
 ev.start_preprocessing()
 
 X, Y = map(gpu, [X, Y])
-A = norm_adj(E, n_nodes, args.asymmetric).to(X.device)
-AT = None
-if args.asymmetric and not is_bidir:
-    AT = norm_adj(E, n_nodes, args.asymmetric).to(X.device)
-if args.method == 'SGC':
-    for _ in range(args.n_layers):
-        X = A @ X
-    args.n_layers = 3
+if args.method in ('SGC', 'IGNN') or args.correct or args.smooth:
+    A = norm_adj(E, n_nodes).to(X.device)
+    if args.method == 'SGC':
+        for _ in range(args.n_layers):
+            X = A @ X
+        args.n_layers = 3
+E = gpu(E)
 
 ev.stop_preprocessing()
 
@@ -709,69 +669,49 @@ for run in range(args.runs):
     train_y = Y[train_mask].float()
     if not is_multiclass:
         train_y = F.one_hot(Y[train_mask], n_labels).float()
+    if args.inductive:
+        induc_mask = gpu(valid_mask | test_mask)[E].sum(dim=0).bool()
+        induc_E = E[:, ~induc_mask]
+    else:
+        induc_E = E
 
     torch.manual_seed(run)
     ev.start_run()
 
-    if args.method in ('MLP', 'SGC'):
-        # https://arxiv.org/abs/1902.07153
-        net = Net(n_features, args.hidden, n_labels, **args.__dict__)
-        opt = Optim([*net.parameters()])
-        for epoch in range(1, 1 + args.max_epochs):
-            with opt:
-                criterion(net(X[train_mask]), Y[train_mask]).mean().backward()
-            ev.record_training(opt.elapsed)
-            if ev.evaluate_model(net):
-                break
-    elif args.method == 'GCN':
-        # GCN with Label Tricks (Label as Input & Label Reuse)
-        # https://arxiv.org/abs/2103.13355
-        in_feats = n_features
-        x = X
-        rec_mask = train_mask
-        if args.label_input:
-            in_feats += n_labels
-            x = torch.cat(
-                (X, torch.zeros((n_nodes, n_labels)).to(X.device)), dim=1)
-        net = Net(in_feats, args.hidden, n_labels, A=A, AT=AT, **args.__dict__)
-        opt = Optim([*net.parameters()])
-        for epoch in range(1, 1 + args.max_epochs):
-            with opt:
-                if args.label_input:
-                    input_mask = train_mask & (
-                        torch.rand(n_nodes) < args.label_input)
-                    rec_mask = train_mask & (~input_mask)
-                    x[:, -n_labels:] = 0
-                    x[input_mask, -n_labels:] = train_y[input_mask[train_mask]]
-                    if args.label_reuse:
-                        with torch.no_grad():
-                            net.eval()
-                            for _ in range(args.label_reuse):
-                                x[~input_mask, -n_labels:] = sg(
-                                    net(x))[~input_mask]
-                        net.train()
-                Z = net(x)
-                criterion(Z[rec_mask], Y[rec_mask]).mean().backward()
-            ev.record_training(opt.elapsed)
-            t = time.time()
-            with torch.no_grad():
-                net.eval()
-                if args.label_input:
-                    x[:, -n_labels:] = 0
-                    x[train_mask, -n_labels:] = train_y
-                    for _ in range(args.label_reuse):
-                        x[~train_mask, -n_labels:] = sg(net(x))[~train_mask]
-                    Z = net(x)
-                net.train()
-            ev.record_evaluation(time.time() - t)
-            if ev.evaluate_result(sg(Z)):
-                break
+    prs = {}
+    wocs = copy.deepcopy(args)
+    wocs.runs = 0
+    wocs.correct = wocs.correct_rate = wocs.smooth = wocs.smooth_rate = 0
+    wocs = str(wocs)
+    prs_fn = 'predictions/%s-%s-%s.json' % (
+        args.method,
+        args.dataset,
+        hashlib.md5(wocs.encode()).hexdigest(),
+    )
+    if os.path.exists(prs_fn):
+        try:
+            with open(prs_fn) as file:
+                prs = json.load(file)
+        except Exception:
+            print('Load predictions failed:', prs_fn)
+            prs = {}
+
+    if (args.correct or args.smooth) and (
+            prs.get('settings') == wocs and ('run-%d' % run in prs)):
+        ev.best_acc, ev.best_y = prs['run-%d' % run]
+        ev.best_y = gpu(torch.tensor(ev.best_y))
+        print('Load predictions made at: %s' % prs['date'])
+        opt = None
     elif args.method == 'IGNN':
         # https://arxiv.org/abs/2009.06211
         if args.dataset.startswith('chain-'):
             from models_chains import IGNN
         else:
             from models_heterophilic import IGNN
+        if args.inductive:
+            induc_A = gpu(norm_adj(induc_E.cpu(), n_nodes))
+        else:
+            induc_A = A
         net = IGNN(
             n_features, args.hidden, n_labels, n_nodes, args.dropout
         ).to(X.device)
@@ -779,10 +719,12 @@ for run in range(args.runs):
         x = X.T
         for epoch in range(1, 1 + args.max_epochs):
             with opt:
-                Z = net(x, A)
-                criterion(Z[train_mask], Y[train_mask]).mean().backward()
+                z = net(x, induc_A)
+                criterion(z[train_mask], Y[train_mask]).mean().backward()
             ev.record_training(opt.elapsed)
-            if ev.evaluate_result(sg(Z)):
+            if args.inductive:
+                z = net(x, A)
+            if ev.evaluate_result(sg(z)):
                 break
     elif args.method == 'EIGNN':
         # https://arxiv.org/abs/2202.10720
@@ -813,112 +755,198 @@ for run in range(args.runs):
         x = X.T
         for epoch in range(1, 1 + args.max_epochs):
             with opt:
-                Z = net(x)
-                criterion(Z[train_mask], Y[train_mask]).mean().backward()
+                z = net(x)
+                criterion(z[train_mask], Y[train_mask]).mean().backward()
             ev.record_training(opt.elapsed)
-            if ev.evaluate_result(sg(Z)):
+            if ev.evaluate_result(sg(z)):
                 break
-    elif args.method == 'GQN' and args.label_input:
-        net = Net(
-            n_features + n_labels, args.hidden, n_labels,
-            A=A, AT=AT, **args.__dict__)
-        opt = Optim([*net.parameters()])
-        history = torch.zeros((n_nodes, n_labels)).to(
-            X.device).requires_grad_(True)
-        history.data = sg(history.data)
-        history.grad = history.data * 0
-        for epoch in range(1, 1 + args.max_epochs):
-            with opt:
-                rec_mask = train_mask
-                history.data[train_mask] = train_y
-                if 0 < args.label_input < 1:
-                    rec_mask = train_mask & (
-                        torch.rand(n_nodes) > args.label_input)
-                    history.data[rec_mask] = 0
-                if args.drop_state:
-                    history.data = F.dropout(history.data, p=args.drop_state)
-                Z = net(torch.cat((X, history), dim=1))
-                history_grad, history.grad = history.grad, None
-                Z.register_hook(lambda grad: grad + history_grad)
-                criterion(Z[rec_mask], Y[rec_mask]).mean().backward()
-                # Back Propagate through the softmax activator
-                history.grad *= history.data * (1 - history.data)
-                if args.noise:
-                    r = sg(torch.randn(history.shape).to(X.device))
-                    Zr = net(torch.cat((X, r), dim=1))
-                    # TODO: for single-label classification only
-                    kl = (-F.log_softmax(Zr, dim=1) * history.data).sum(dim=1)
-                    (args.noise * kl.mean()).backward()
-            ev.record_training(opt.elapsed)
-            # NOTE: for convenience and efficiency, all methods except MLP
-            # reuse output in training for evaluation
-            # if ev.evaluate_model(net, history.data, n_labels):
-            if ev.evaluate_result(Z):
-                with torch.no_grad():
-                    steady_se = ((history - sg(Z)) ** 2)[
-                        ~train_mask].sum().item()
-                    print('fixed point SE:', steady_se)
-                    if not args.noise:
-                        r = sg(torch.randn(history.shape).to(X.device))
-                        Zr = net(torch.cat((X, r), dim=1))
-                    unsteady_se = ((r - Zr) ** 2)[~train_mask].sum().item()
-                    print('unsteady point SE:', unsteady_se)
-                break
-            history.data = sg(Z.detach())
-    elif args.method == 'GQN':
-        net = gpu(nn.Sequential(
-            Net(
-                n_features + args.hidden, args.hidden, args.hidden,
-                A=A, AT=AT, **args.__dict__),
-            nn.LayerNorm(args.hidden),
-            nn.Sigmoid(),
-        ))
-        clf = gpu(nn.Sequential(
-            nn.Dropout(args.dropout),
-            nn.Linear(args.hidden, n_labels)))
-        opt = Optim([*net.parameters(), *clf.parameters()])
-        history = torch.zeros((n_nodes, args.hidden)).to(
-            X.device).requires_grad_(True)
-        history.grad = history.data * 0
-        for epoch in range(1, 1 + args.max_epochs):
-            with opt:
-                if args.drop_state:
-                    history.data = F.dropout(history.data, p=args.drop_state)
-                Z = net(torch.cat((X, history), dim=1))
-                history_grad, history.grad = history.grad, None
-                Z.register_hook(lambda grad: grad + history_grad)
-                y = clf(Z)
-                criterion(y[train_mask], Y[train_mask]).mean().backward()
-                if args.noise:
-                    r = torch.rand(history.shape).to(X.device)
-                    Zr = net(torch.cat((X, r), dim=1))
-                    yr = clf(Zr)
-                    # mse = (Zr - history.data).norm()
-                    # TODO: for single-label classification only
-                    kl = (-F.log_softmax(yr, dim=1) * sg(y.detach())
-                          ).sum(dim=1)
-                    (args.noise * kl.mean()).backward()
-            ev.record_training(opt.elapsed)
-            # NOTE: for convenience and efficiency, all methods except MLP
-            # reuse output in training for evaluation
-            # if ev.evaluate_model(net, history.data, n_labels):
-            if ev.evaluate_result(y):
-                with torch.no_grad():
-                    steady_se = ((history - Z) ** 2)[
-                        ~train_mask].sum().item()
-                    print('fixed point SE:', steady_se)
-                    if not args.noise:
-                        r = torch.rand(history.shape).to(X.device)
-                        Zr = net(torch.cat((X, r), dim=1))
-                    unsteady_se = ((r - Zr) ** 2)[~train_mask].sum().item()
-                    print('unsteady point SE:', unsteady_se)
-                break
-            history.data = Z.detach()
     else:
-        opt = None
-        y = torch.zeros((n_nodes, n_labels)).float().to(Y.device)
-        ev.record_training(0)
-        ev.evaluate_result(y)
+        # GNNs with Label (Label as Input & Label Reuse)
+        # https://arxiv.org/abs/2103.13355
+
+        in_feats, x = n_features, X
+        if args.input_label:
+            in_feats += n_labels
+            state = torch.zeros((n_nodes, n_labels)).to(X.device)
+            fwd_contracts = []
+            bkd_contracts = []
+
+        if args.method in ('MLP', 'SGC'):
+            net = gpu(gnn.MLP(
+                [in_feats, *([args.hidden] * (args.n_layers - 1)), n_labels],
+                dropout=args.dropout))
+            fwd = net.forward
+            net.forward = lambda x, E: fwd(x)
+        else:
+            if args.method == 'JKNet':
+                net = JKNet(in_feats, n_labels, **args.__dict__)
+            elif args.method == 'GCNII':
+                net = GCNII(in_feats, n_labels, **args.__dict__)
+            elif args.method == 'GAT':
+                net = gnn.GAT(
+                    in_feats, args.hidden, args.n_layers, n_labels,
+                    args.dropout, heads=args.heads)
+            else:
+                net = {
+                    'GIN': gnn.GIN, 'GCN': gnn.GCN, 'SAGE': gnn.GraphSAGE
+                }[args.method](
+                    in_feats, args.hidden, args.n_layers,
+                    n_labels, args.dropout)
+            net = gpu(net)
+        opt = Optim([*net.parameters()])
+
+        for epoch in range(1, 1 + args.max_epochs):
+            with opt:
+                with torch.no_grad():
+                    input_mask = sup_mask = train_mask
+                    input_y = train_y
+                    if args.input_label:
+                        mask_label = 1 - args.input_label
+                        if args.input_label > 1:
+                            mask_label = 0.5
+                            if fwd_contracts and fwd_contracts[-1]:
+                                mask_label = max(0.1, min(
+                                    0.9, fwd_contracts[-1] - exp))
+                        mask = torch.rand(n_nodes) < mask_label
+                        input_mask = train_mask & ~mask
+                        sup_mask = train_mask & mask
+                        input_y = train_y[input_mask[train_mask]]
+                        # if not sup_mask.any().item():
+                        #     sup_mask = train_mask
+                        #     mask_label = 0
+                        state[:] = 0
+                        if args.for_iter:
+                            net.eval()
+                            last_dist = inf
+                            fwd_contracts.append(0)
+                            for _ in range(args.for_iter):
+                                last_state = state.clone()
+                                state[input_mask] = input_y
+                                if args.back_iter:
+                                    state[mask] = 0
+                                    state /= (1 - mask_label)
+                                state = sg(net(
+                                    torch.cat((X, state), dim=1), induc_E))
+                                # dist = (state - last_state).norm(2).item()
+                                dist = norm(state - last_state).item()
+                                if thres_for >= dist:
+                                    break
+                                fwd_contracts[-1] = max(
+                                    dist / last_dist, fwd_contracts[-1])
+                                last_dist = dist
+                                # Stop iterating if the mapping is expanding
+                                # NOTE: Only when using adaptive input_label to
+                                # avoid impacting ablation studies
+                                if (args.input_label > 1
+                                        and fwd_contracts[-1] - 1 > exp):
+                                    break
+                            net.train()
+
+                    # Masked Label Strategy for Backward-pass
+                    if args.drop_state:
+                        drop_state = args.drop_state
+                        # Adaptively drop state wrt the contractive factor
+                        if args.drop_state >= 1:
+                            drop_state = 0.5
+                            if bkd_contracts and bkd_contracts[-1]:
+                                drop_state = max(0.1, min(
+                                    0.9, bkd_contracts[-1] - exp))
+                        mask = torch.rand(n_nodes) < drop_state
+                        sup_mask = train_mask & mask
+                        input_mask = train_mask & (~mask)
+                        input_y = train_y[input_mask[train_mask]]
+                        # if not sup_mask.any().item():
+                        #     sup_mask = train_mask
+                        #     drop_state = 0
+
+                    if args.input_label:
+                        state[input_mask] = input_y
+                        if args.back_iter:
+                            state[mask] = 0
+                            # Back propagate through masked sigmoid/softmax
+                            dsg = state * (1 - state)
+                            # NOTE: rescale factor should not be taped
+                            # because it simulates the sum of inputted
+                            # and masked states feeding to the next layer
+                            state /= (
+                                (1 - drop_state) if args.drop_state
+                                else (1 - mask_label))
+
+                # Training
+                if args.input_label:
+                    if args.back_iter:
+                        state.grad = None
+                        state.requires_grad_(True)
+                    x = torch.cat((X, state), dim=1)
+                z = net(x, induc_E)
+                if args.back_iter:
+                    criterion(
+                        z[sup_mask], Y[sup_mask]
+                    ).mean().backward(retain_graph=True)
+                    # Implicit Differentiation
+                    last_vjpnorm = inf
+                    bkd_contracts.append(0)
+                    for _ in range(args.back_iter):
+                        state.grad, vjp = None, state.grad
+                        z.backward(vjp * dsg, retain_graph=True)
+                        # vjpnorm = vjp.norm(2).item()
+                        vjpnorm = norm(vjp).item()
+                        if thres_back >= vjpnorm:
+                            break
+                        bkd_contracts[-1] = max(
+                            vjpnorm / last_vjpnorm, bkd_contracts[-1])
+                        # Stop iterating if the mapping is expanding
+                        # NOTE: Only when using adaptive drop_state to
+                        # avoid impacting ablation studies
+                        if (args.drop_state >= 1
+                                and bkd_contracts[-1] - 1 > exp):
+                            break
+                        last_vjpnorm = vjpnorm
+                else:
+                    criterion(z[sup_mask], Y[sup_mask]).mean().backward()
+            ev.record_training(opt.elapsed)
+
+            # Inference
+            t = time.time()
+            with torch.no_grad():
+                net.eval()
+                if args.input_label:
+                    state[:] = 0
+                    if args.for_iter:
+                        last_dist = inf
+                        for _ in range(args.for_iter):
+                            last_state = state.clone()
+                            state[train_mask] = train_y
+                            state = sg(net(torch.cat((X, state), dim=1), E))
+                            dist = norm(state - last_state).item()
+                            if thres_for >= dist:
+                                break
+                            last_dist = dist
+                    state[train_mask] = train_y
+                    x = torch.cat((X, state), dim=1)
+                state = sg(net(x, E))
+                net.train()
+            ev.record_evaluation(time.time() - t)
+            if ev.evaluate_result(state):
+                break
+
+        if args.for_iter:
+            print('forward contracts:', fwd_contracts)
+            print('forward contract:',
+                  fwd_contracts[-args.early_stop_epochs - 1])
+        if args.back_iter:
+            print('backward contracts:', bkd_contracts)
+            print('backward contract:',
+                  bkd_contracts[-args.early_stop_epochs - 1])
+
+    try:
+        with open(prs_fn, 'w') as file:
+            prs['settings'] = wocs
+            prs['date'] = str(datetime.datetime.now())
+            prs['run-%d' % run] = [ev.best_acc, ev.best_y.cpu().tolist()]
+            json.dump(prs, file)
+    except Exception:
+        pass
 
     # Correct and Smooth
     # https://arxiv.org/abs/2010.13993

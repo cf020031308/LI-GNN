@@ -1,31 +1,30 @@
 #!/bin/bash -
 
 set -x
-gpu=0
-runs=10
+fn=$(basename "$0")
+args="--runs 10"
 
 for length in $(seq 10 10 100); do
     dataset="chain-$length"
-    # GCN
-    # time python3 -u main.pyc GCN $dataset --gpu $gpu --runs $runs 2>&1
-    # time python3 -u main.pyc GCN $dataset --gpu $gpu --runs $runs --skip-connection 2>&1
+    # MLP
+    time python3 -u main.pyc MLP $dataset $args --n-layers 3 2>&1
     # SGC
-    for layers in 10 20 30 50; do
-        time python3 -u main.pyc SGC $dataset --gpu $gpu --runs $runs --n-layers $layers 2>&1
+    for layers in 2 10 50 100; do
+        time python3 -u main.pyc SGC $dataset $args --n-layers $layers 2>&1
     done
-
-    # C&S
-    time python3 -u main.pyc MLP $dataset --gpu $gpu --runs $runs --correct 50 --correct-rate 0.1 --smooth 50 --smooth-rate 0.1 2>&1
-    # Label Input & Reuse
-    for reuse in 0 1; do
-        time python3 -u main.pyc GCN $dataset --gpu $gpu --runs $runs --label-input 0.5 --label-reuse $reuse 2>&1
-    done
-
     # IGNN
-    time python3 -u main.pyc IGNN $dataset --gpu $gpu --runs $runs 2>&1
+    time python3 -u main.pyc IGNN $dataset $args 2>&1
     # EIGNN
-    time python3 -u main.pyc EIGNN $dataset --gpu $gpu --runs $runs 2>&1
-    # GQN
-    time python3 -u main.pyc GQN $dataset --gpu $gpu --runs $runs --label-input 0.5 2>&1
-done | tee -a logs/$0.log
+    time python3 -u main.pyc EIGNN $dataset $args 2>&1
+    # C&S
+    for ln in 1 10 50 100; do
+        time python3 -u main.pyc MLP $dataset $args --n-layers 3 --correct $ln --correct-rate 0.5 --smooth $ln --smooth-rate 0.5 2>&1
+    done
+    # Label Input & Reuse
+    for reuse in 0 1 10 50 100; do
+        time python3 -u main.pyc GCN $dataset $args --input-label 0.5 --for-iter $reuse 2>&1
+    done
+    # LI-GNN
+    time python3 -u main.pyc GCN $dataset $args --input-label 1 --for-iter 100 --back-iter 100 --drop-state 1 2>&1
+done | tee -a logs/$fn.log
 date
