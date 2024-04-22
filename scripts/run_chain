@@ -4,27 +4,25 @@ set -x
 fn=$(basename "$0")
 args="--runs 10"
 
-for length in $(seq 10 10 100); do
-    dataset="chain-$length"
-    # MLP
-    time python3 -u main.pyc MLP $dataset $args --n-layers 3 2>&1
-    # SGC
-    for layers in 2 10 50 100; do
-        time python3 -u main.pyc SGC $dataset $args --n-layers $layers 2>&1
+for chain in chain hetchain; do
+    for length in 2 4 8 16 32 64 128 256; do
+        dataset="${chain}-${length}"
+        # MLP
+        time python3 -u main.py MLP $dataset $args --n-layers 3
+        # SGC
+        for layers in 10 50 300; do
+            time python3 -u main.py SGC $dataset $args --n-layers $layers
+        done
+        # IGNN
+        time python3 -u main.py IGNN $dataset $args
+        # EIGNN
+        time python3 -u main.py EIGNN $dataset $args
+        # Label Input & Reuse
+        for reuse in 0 10 50 100; do
+            time python3 -u main.py SAGE $dataset $args --input-label 0.5 --for-iter $reuse --original-reuse
+        done
+        # LaE
+        time python3 -u main.py SAGE $dataset $args --input-label 1 --drop-state 0.5 --for-iter 300 --back-iter -1 --terminate-back
     done
-    # IGNN
-    time python3 -u main.pyc IGNN $dataset $args 2>&1
-    # EIGNN
-    time python3 -u main.pyc EIGNN $dataset $args 2>&1
-    # C&S
-    for ln in 1 10 50 100; do
-        time python3 -u main.pyc MLP $dataset $args --n-layers 3 --correct $ln --correct-rate 0.5 --smooth $ln --smooth-rate 0.5 2>&1
-    done
-    # Label Input & Reuse
-    for reuse in 0 1 10 50 100; do
-        time python3 -u main.pyc GCN $dataset $args --input-label 0.5 --for-iter $reuse 2>&1
-    done
-    # LI-GNN
-    time python3 -u main.pyc GCN $dataset $args --input-label 1 --for-iter 100 --back-iter 100 --drop-state 1 2>&1
 done | tee -a logs/$fn.log
 date

@@ -1,0 +1,35 @@
+#!/bin/bash -
+
+set -x
+fn=$(basename "$0")
+args="--runs 10 --dropout 0.5"
+
+function run_gnns() {
+    time python3 -u main.py GCN $@
+    time python3 -u main.py SAGE $@
+    time python3 -u main.py GAT --hidden 64 --heads 1 $@
+    time python3 -u main.py JKNet --n-layers 3 $@
+    time python3 -u main.py GCNII --n-layers 4 --alpha 0.1 --theta 0.5 $@
+}
+
+for dataset in chameleon squirrel roman_empire amazon_ratings pubmed amazon-photo amazon-com coauthor-cs; do
+    run_gnns $dataset
+    for alpha in 0.1 0.3 0.5 0.7 0.9; do
+        # LaI + LR
+        for reuse in 0 1 2 3; do
+            run_gnns $dataset --input-label $alpha --for-iter $reuse --original-reuse
+        done
+        for beta in 0 0.25 0.5; do
+            # LR+r
+            for reuse in 1 2 3; do
+                run_gnns $dataset --input-label 1 --drop-state $alpha --for-iter $reuse --drop-features $beta
+            done
+            # LR+8
+            run_gnns $dataset --input-label 1 --drop-state $alpha --for-iter 300 --drop-features $beta --cache
+            # LaE
+            run_gnns $dataset --input-label 1 --drop-state $alpha --for-iter 300 --back-iter -1 --terminate-back --drop-features $beta --cache
+        done
+    done
+done | tee -a logs/$fn.log
+
+date

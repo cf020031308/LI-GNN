@@ -1,12 +1,11 @@
 import os
 import time
 import json
-import copy
-import hashlib
 import datetime
 import argparse
 
 import psutil
+import numpy
 import torch
 import torch.nn as nn
 import torch_geometric.nn as gnn
@@ -47,11 +46,11 @@ parser.add_argument(
     '--max-epochs', type=int, default=1000,
     help='Maximum epochs. Default: 1000')
 parser.add_argument(
-    '--hidden', type=int, default=64,
-    help='Dimension of hidden representations and implicit state. Default: 64')
+    '--hidden', type=int, default=256,
+    help='Dimension of hidden representations and implicit state. Default: 256')
 parser.add_argument(
     '--heads', type=int, default=1,
-    help='Number of attention heads for GAT. Default: 0')
+    help='Number of attention heads for GAT. Default: 1')
 parser.add_argument(
     '--alpha', type=float, default=0.5,
     help='Hyperparameter for GCNII. Default: 0.5')
@@ -59,38 +58,33 @@ parser.add_argument(
     '--theta', type=float, default=1.0,
     help='Hyperparameter for GCNII. Default: 1.0')
 parser.add_argument(
-    '--correct', type=int, default=0,
-    help='Iterations for Correct after prediction. Default: 0')
+    '--drop-state', type=float, default=0,
+    help='Ratio of known labels to mask in input. Default: 0')
 parser.add_argument(
-    '--correct-rate', type=float, default=0.1,
-    help='Propagation rate for Correct after prediction. Default: 0.1')
+    '--drop-features', type=float, default=0,
+    help='Ratio of node features to mask in input. Default: 0')
 parser.add_argument(
-    '--smooth', type=int, default=0,
-    help='Iterations for Smooth after prediction. Default: 0')
-parser.add_argument(
-    '--smooth-rate', type=float, default=0.1,
-    help='Propagation rate for Smooth after prediction. Default: 0.1')
-parser.add_argument(
-    '--input-label', type=float, default=0.0,
+    '--input-label', type=float, default=0,
     help='Ratio of known labels for input. Default: 0')
 parser.add_argument(
     '--for-iter', type=int, default=0,
     help='Iterations to produce state in forward-pass. Default: 0')
 parser.add_argument(
     '--back-iter', type=int, default=0,
-    help='Iterations to accumulate vjp in backward-pass. Default: 0')
+    help=('Iterations to accumulate vjp in backward-pass'
+          ' (0: disabled; -1: adaptive). Default: 0'))
 parser.add_argument(
-    '--drop-state', type=float, default=0.0,
-    help='Ratio of state for dropping. Default: 0')
+    '--original-reuse', action='store_true',
+    help='apply the original version (with label leakage) of label reuse')
 parser.add_argument(
-    '--inductive', action='store_true',
-    help='Enable the inductive setting')
+    '--terminate-back', action='store_true',
+    help='terminate backward pass if the norm of vjp expands')
+parser.add_argument(
+    '--cache', action='store_true',
+    help='accelerate iterations with cache')
 args = parser.parse_args()
 
 inf = float('inf')
-exp = 0.1
-norm = lambda x: (x ** 2).mean() ** 0.5
-
 if not torch.cuda.is_available():
     args.gpu = -1
 print(datetime.datetime.now(), args)
@@ -132,7 +126,7 @@ class JKNet(nn.Module):
         self.convs.append(gnn.GCNConv(din, hidden))
         for _ in range(n_layers - 1):
             self.convs.append(gnn.GCNConv(hidden, hidden))
-        self.lin = nn.Linear(hidden * n_layers, n_labels)
+        self.lin = nn.Linear(hidden * n_layers, dout)
         self.jk = gnn.JumpingKnowledge(mode='cat')
         self.dropout = nn.Dropout(dropout)
 
@@ -168,6 +162,7 @@ class GCNII(nn.Module):
 
 def load_data(name):
     is_bidir = None
+    train_masks = None
     if args.dataset == 'weekday':
         # https://www.mdpi.com/2227-7390/10/8/1262/htm
         fn = 'dataset/weekday.dat'
@@ -207,8 +202,7 @@ def load_data(name):
             dst = torch.cat([adj[:, i] for i in range(adj.shape[1])], dim=0)
             E = torch.cat((src.unsqueeze(0), dst.unsqueeze(0)))
             torch.save((X, Y, E), 'dataset/weekday.dat')
-        train_mask = None
-    elif args.dataset.startswith('chain-'):
+    elif 'chain-' in args.dataset:
         """load the synthetic dataset: chain"""
         # https://github.com/SwiftieH/IGNN
         import numpy as np
@@ -221,24 +215,25 @@ def load_data(name):
                 np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
             values = torch.from_numpy(sparse_mx.data)
             shape = torch.Size(sparse_mx.shape)
-            tensor = torch.sparse.FloatTensor(indices, values, shape)
+            tensor = torch.sparse_coo_tensor(indices, values, shape)
             if device is not None:
                 tensor = tensor.to(device)
             return tensor
 
         r = np.random.RandomState(42)
         c = 10  # num of classes
-        n = 20  # chains for each class
-        lx = int(args.dataset[6:])  # length of chain
+        n = 50  # chains for each class
+        lx = int(args.dataset.split('-')[-1])  # length of chain
         f = 100  # feature dimension
         n_nodes = c * n * lx
-        tn = int(n_nodes * 0.05)  # train nodes
-        # NOTE: Our training nodes are fewer than that in EIGNN
-        # to keep label information sparse when the chain is long
+        # NOTE: Training nodes are `tn = int(n_nodes * 0.05)` in EIGNN
+        # we change it to sparsify label information when chains lengthen
         tn = c * n
         vl = int(n_nodes * 0.1)  # val nodes
         tt = n_nodes - tn - vl  # test nodes
-        ns = 0.00  # noise
+        # NOTE: IGNN and EIGNN cannot handle noise
+        # Because their real propagation is without transformation
+        ns = 0.01  # noise
 
         chain_adj = sp.coo_matrix((
             np.ones(lx-1), (np.arange(lx-1), np.arange(1, lx))
@@ -249,12 +244,20 @@ def load_data(name):
         features = r.uniform(-ns, ns, size=(c, n, lx, f))
         # features = np.zeros_like(features)
         # add class info to the first node of chains.
-        features[:, :, 0, :c] += np.eye(c).reshape(c, 1, c)
+        features[:, :, :, :c] = 0
+        features[:, :, 0, :c] = np.eye(c).reshape(c, 1, c)
         features = features.reshape(-1, f)
+        features = torch.FloatTensor(np.array(
+            features.todense() if sp.issparse(features) else features)).float()
 
-        labels = np.eye(c).reshape(c, 1, 1, c).repeat(
-            n, axis=1).repeat(lx, axis=2)  # one-hot labels
-        labels = labels.reshape(-1, c)
+        # homophilic chains
+        labels = torch.arange(c).view(-1, 1, 1).repeat(1, n, lx).long()
+        # heterophilic chains
+        if args.dataset.startswith('hetchain-'):
+            for i in range(c):
+                labels[i, :, [j for j in range(lx) if j % 2 == 1]] = (
+                    (i + 1) if i % 2 == 0 else (i - 1)) % c
+        labels = labels.view(-1)
 
         idx_random = np.arange(c*n*lx)
         r.shuffle(idx_random)
@@ -262,11 +265,6 @@ def load_data(name):
         idx_val = idx_random[tn:tn+vl]
         idx_test = idx_random[tn+vl:tn+vl+tt]
 
-        # porting to pytorch
-        features = torch.FloatTensor(np.array(
-            features.todense() if sp.issparse(features) else features)).float()
-        labels = torch.LongTensor(labels)
-        labels = torch.max(labels, dim=1)[1]
         adj = sparse_mx_to_torch_sparse_tensor(adj).float()
         idx_train = torch.LongTensor(idx_train)
         idx_val = torch.LongTensor(idx_val)
@@ -284,6 +282,17 @@ def load_data(name):
         train_masks = [train_mask] * args.runs
         valid_masks = [valid_mask] * args.runs
         test_masks = [test_mask] * args.runs
+    elif args.dataset in (
+        'roman_empire', 'amazon_ratings', 'minesweeper',
+        'tolokers', 'questions',
+    ):
+        data = numpy.load('dataset/hetgs/%s.npz' % args.dataset)
+        X, Y, E, train_masks, valid_masks, test_masks = map(data.get, [
+            'node_features', 'node_labels', 'edges',
+            'train_masks', 'val_masks', 'test_masks'])
+        X, Y, E, train_masks, valid_masks, test_masks = map(torch.from_numpy, [
+            X, Y, E.T, train_masks, valid_masks, test_masks])
+        is_bidir = False
     elif args.dataset in ('arxiv', 'mag', 'products'):
         ds = NodePropPredDataset(name='ogbn-%s' % args.dataset)
         train_idx, valid_idx, test_idx = map(
@@ -298,7 +307,7 @@ def load_data(name):
             g['edge_index'] = g['edge_index_dict'][('paper', 'cites', 'paper')]
             g['node_feat'] = g['node_feat_dict']['paper']
         X = torch.from_numpy(g['node_feat'])
-        Y = torch.from_numpy(labels).clone().squeeze(-1)
+        Y = torch.from_numpy(labels).squeeze(-1)
         E = torch.from_numpy(g['edge_index'])
         n_nodes = X.shape[0]
         train_mask = torch.zeros(n_nodes, dtype=bool)
@@ -317,12 +326,14 @@ def load_data(name):
         n_nodes = 0
         X, Y, E, mask = [], [], [], []
         for mode in 'train valid test'.split():
-            for g in dgl_data.PPIDataset(mode):
+            for i, g in enumerate(dgl_data.PPIDataset(mode)):
                 X.append(g.ndata['feat'])
                 Y.append(g.ndata['label'])
                 E.append(n_nodes + torch.cat(
                     [e.view(1, -1) for e in g.edges()], dim=0))
                 n_nodes += X[-1].shape[0]
+                # TODO: remove it
+                break
             mask.append(n_nodes)
         X = torch.cat(X, dim=0)
         Y = torch.cat(Y, dim=0)
@@ -337,7 +348,7 @@ def load_data(name):
         valid_masks = [valid_mask] * args.runs
         test_masks = [test_mask] * args.runs
     elif args.dataset in (
-        'cora', 'citeseer', 'pubmed', 'corafull', 'reddit',
+        'cora', 'citeseer', 'pubmed', 'corafull', 'reddit', 'actor',
         'coauthor-cs', 'coauthor-phy', 'amazon-com', 'amazon-photo',
     ):
         g = (
@@ -354,15 +365,22 @@ def load_data(name):
             if args.dataset == 'amazon-com'
             else dgl_data.AmazonCoBuyPhotoDataset()
             if args.dataset == 'amazon-photo'
+            else dgl_data.ActorDataset()
+            if args.dataset == 'actor'
             else None
         )[0]
         X, Y, train_mask, valid_mask, test_mask = map(
             g.ndata.get, 'feat label train_mask val_mask test_mask'.split())
         E = torch.cat([e.view(1, -1) for e in g.edges()], dim=0)
         is_bidir = True
-        train_masks = [train_mask] * args.runs
-        valid_masks = [valid_mask] * args.runs
-        test_masks = [test_mask] * args.runs
+        if args.dataset == 'actor':
+            train_masks = train_mask.T
+            valid_masks = valid_mask.T
+            test_masks = test_mask.T
+        else:
+            train_masks = [train_mask] * args.runs
+            valid_masks = [valid_mask] * args.runs
+            test_masks = [test_mask] * args.runs
     else:
         dn = 'dataset/' + args.dataset
         g = (
@@ -385,9 +403,9 @@ def load_data(name):
         else:
             train_masks = [train_mask[:, i % train_mask.shape[1]]
                            for i in range(args.runs)]
-            valid_masks = [valid_mask[:, i % train_mask.shape[1]]
+            valid_masks = [valid_mask[:, i % valid_mask.shape[1]]
                            for i in range(args.runs)]
-            test_masks = [test_mask[:, i % train_mask.shape[1]]
+            test_masks = [test_mask[:, i % test_mask.shape[1]]
                           for i in range(args.runs)]
             is_bidir = False
     if is_bidir is None:
@@ -416,7 +434,7 @@ def load_data(name):
     # Get Undirectional Edges
     if not is_bidir:
         E = torch.cat((E, E[[1, 0]]), dim=1)
-    if train_mask is None and not args.split:
+    if (train_masks is None or train_masks[0] is None) and not args.split:
         args.split = 0.6
     nrange = torch.arange(X.shape[0])
     if 0 < args.split < 1:
@@ -511,33 +529,28 @@ class Stat(object):
         self.evaluation_times[-1] += elapsed
 
     def evaluate_result(self, y):
-        valid_y = y[valid_mask]
-        test_y = y[test_mask]
-        if is_multiclass:
-            self.scores.append([
-                get_score(Y[valid_mask], valid_y > 0.5),
-                get_score(Y[test_mask], test_y > 0.5)])
-        else:
-            self.scores.append([
-                get_score(Y[valid_mask], valid_y.argmax(dim=1)),
-                get_score(Y[test_mask], test_y.argmax(dim=1))])
+        _y = labelize(y)
+        self.scores.append([
+            get_score(Y[m], _y[m])
+            for m in [train_mask, valid_mask, test_mask]])
         self.acc_training_times.append(self.training_times[-1])
         self.acc_times.append(self.preprocess_time + self.training_times[-1])
-        dec_epochs = len(self.scores) - 1 - torch.tensor(
-            self.scores).max(dim=0).indices[0]
+        self.best_epoch = torch.tensor(self.scores).max(dim=0).indices[1] + 1
+        dec_epochs = len(self.scores) - self.best_epoch
         if dec_epochs == 0:
-            self.best_acc = self.scores[-1][0]
+            self.best_acc = self.scores[-1][1]
             self.best_y = y
         return dec_epochs >= args.early_stop_epochs
 
     def end_run(self):
-        print('val scores:', [s for s, _ in self.scores])
-        print('test scores:', [s for _, s in self.scores])
-        print('acc training times:', self.acc_training_times)
         self.scores = torch.tensor(self.scores)
+        print('train scores:', self.scores[:, 0].tolist())
+        print('val scores:', self.scores[:, 1].tolist())
+        print('test scores:', self.scores[:, 2].tolist())
+        print('acc training times:', self.acc_training_times)
         print('max scores:', self.scores.max(dim=0).values)
-        idx = self.scores.max(dim=0).indices[0]
-        self.best_test_scores.append((idx, self.scores[idx, 1]))
+        idx = self.scores.max(dim=0).indices[1]
+        self.best_test_scores.append((idx, self.scores[idx, 2]))
         self.best_training_times.append(self.acc_training_times[idx])
         self.best_times.append(self.acc_times[idx])
         print('best test score:', self.best_test_scores[-1])
@@ -608,23 +621,41 @@ print('split: %d (%.2f%%) / %d (%.2f%%) / %d (%.2f%%)' % (
     valid_sum, 100 * valid_sum / n_nodes,
     test_sum, 100 * test_sum / n_nodes,
 ))
-print('intra_rate: %.2f%%' % (100 * (
-    Y[E[0]] == Y[E[1]]).sum().float() / E.shape[1] / (
-        n_labels if is_multiclass else 1)))
+eh = (
+    (Y[E[0]] == Y[E[1]]).sum().float()
+    / E.shape[1] / (n_labels if is_multiclass else 1))
+print('intra_rate: %.2f%%' % (100 * eh))
+
+ds = torch.zeros(n_nodes)
+ds.scatter_add_(dim=0, index=E[0], src=torch.ones(E.shape[1]))
+if is_multiclass:
+    ds = ds.unsqueeze(-1).repeat(1, n_labels)
+    hs = torch.zeros(n_nodes, n_labels)
+    for i in range(n_labels):
+        hs[:, i].scatter_add_(
+            dim=0, index=E[0], src=(Y[E[0], i] == Y[E[1], i]).float())
+else:
+    hs = torch.zeros(n_nodes)
+    hs.scatter_add_(dim=0, index=E[0], src=(Y[E[0]] == Y[E[1]]).float())
+nh = (hs / ds)[ds > 0].mean()
+print('node homophily: %.2f%%' % (100 * nh))
+
+if not is_multiclass:
+    d2 = sum([ds[Y == i].sum() ** 2 for i in range(n_labels)])
+    d2 *= E.shape[1] ** -2
+    ah = (eh - d2) / (1 - d2)
+    print('adjusted homophily: %.2f%%' % (100 * ah))
 
 if is_multiclass:
     _cri = nn.BCEWithLogitsLoss(reduction='none')
     criterion = lambda x, y: _cri(x, y).sum(dim=1)
     sg = torch.sigmoid
-    lsg = F.logsigmoid
-    thres_for = 1e-4 * 0.5
-    thres_back = 1e-5 * 0.25
+    labelize = lambda x: x > 0.5
 else:
     criterion = lambda x, y: F.cross_entropy(x, y, reduction='none')
     sg = lambda x: torch.softmax(x, dim=-1)
-    lsg = lambda x: F.log_softmax(x, dim=-1)
-    thres_for = 1e-4 / n_labels
-    thres_back = 1e-5 * (n_labels - 1) / n_labels / n_labels
+    labelize = lambda x: x.argmax(dim=1)
+thres_for = thres_back = 3e-6
 
 
 def norm_adj(edges, n, asym=False):
@@ -652,7 +683,7 @@ ev = Stat()
 ev.start_preprocessing()
 
 X, Y = map(gpu, [X, Y])
-if args.method in ('SGC', 'IGNN') or args.correct or args.smooth:
+if args.method in ('SGC', 'IGNN'):
     A = norm_adj(E, n_nodes).to(X.device)
     if args.method == 'SGC':
         for _ in range(args.n_layers):
@@ -666,52 +697,23 @@ for run in range(args.runs):
     train_mask = train_masks[run]
     valid_mask = valid_masks[run]
     test_mask = test_masks[run]
-    train_y = Y[train_mask].float()
-    if not is_multiclass:
-        train_y = F.one_hot(Y[train_mask], n_labels).float()
-    if args.inductive:
-        induc_mask = gpu(valid_mask | test_mask)[E].sum(dim=0).bool()
-        induc_E = E[:, ~induc_mask]
+    if is_multiclass:
+        train_y = Y[train_mask].float()
     else:
-        induc_E = E
+        train_y = F.one_hot(Y[train_mask], n_labels).float()
+    induc_E = E
 
     torch.manual_seed(run)
+    torch.cuda.manual_seed_all(run)
     ev.start_run()
 
-    prs = {}
-    wocs = copy.deepcopy(args)
-    wocs.runs = 0
-    wocs.correct = wocs.correct_rate = wocs.smooth = wocs.smooth_rate = 0
-    wocs = str(wocs)
-    prs_fn = 'predictions/%s-%s-%s.json' % (
-        args.method,
-        args.dataset,
-        hashlib.md5(wocs.encode()).hexdigest(),
-    )
-    if os.path.exists(prs_fn):
-        try:
-            with open(prs_fn) as file:
-                prs = json.load(file)
-        except Exception:
-            print('Load predictions failed:', prs_fn)
-            prs = {}
-
-    if (args.correct or args.smooth) and (
-            prs.get('settings') == wocs and ('run-%d' % run in prs)):
-        ev.best_acc, ev.best_y = prs['run-%d' % run]
-        ev.best_y = gpu(torch.tensor(ev.best_y))
-        print('Load predictions made at: %s' % prs['date'])
-        opt = None
-    elif args.method == 'IGNN':
+    if args.method == 'IGNN':
         # https://arxiv.org/abs/2009.06211
         if args.dataset.startswith('chain-'):
-            from models_chains import IGNN
+            from EIGNN.models_chains import IGNN
         else:
-            from models_heterophilic import IGNN
-        if args.inductive:
-            induc_A = gpu(norm_adj(induc_E.cpu(), n_nodes))
-        else:
-            induc_A = A
+            from EIGNN.models_heterophilic import IGNN
+        induc_A = A
         net = IGNN(
             n_features, args.hidden, n_labels, n_nodes, args.dropout
         ).to(X.device)
@@ -722,20 +724,18 @@ for run in range(args.runs):
                 z = net(x, induc_A)
                 criterion(z[train_mask], Y[train_mask]).mean().backward()
             ev.record_training(opt.elapsed)
-            if args.inductive:
-                z = net(x, A)
             if ev.evaluate_result(sg(z)):
                 break
     elif args.method == 'EIGNN':
         # https://arxiv.org/abs/2202.10720
         # https://github.com/liu-jc/EIGNN
-        if args.dataset.startswith('chain-'):
-            from models_chains import EIGNN_Linear as EIGNN
+        if 'chain-' in args.dataset:
+            from EIGNN.models_chains import EIGNN_Linear as EIGNN
         else:
-            from models_heterophilic import IDM_SGC_Linear as EIGNN
+            from EIGNN.models_heterophilic import IDM_SGC_Linear as EIGNN
         if run == 0:
-            from normalization import aug_normalized_adjacency
-            from utils import sparse_mx_to_torch_sparse_tensor
+            from EIGNN.normalization import aug_normalized_adjacency
+            from EIGNN.utils import sparse_mx_to_torch_sparse_tensor
             import scipy.sparse as sp
             adj = sp.coo_matrix(
                 (torch.ones(E.shape[1]), E.cpu()),
@@ -745,7 +745,7 @@ for run in range(args.runs):
         net = EIGNN(
             adj, sp_adj, n_features, n_labels, num_eigenvec=100, gamma=0.8
         ).to(X.device)
-        if args.dataset.startswith('chain-'):
+        if 'chain-' in args.dataset:
             net.EIGNN.Lambda_S = net.EIGNN.Lambda_S.to(X.device)
             net.EIGNN.Q_S = net.EIGNN.Q_S.to(X.device)
         else:
@@ -760,150 +760,170 @@ for run in range(args.runs):
             ev.record_training(opt.elapsed)
             if ev.evaluate_result(sg(z)):
                 break
+    elif args.method == 'MGNNI':
+        # https://arxiv.org/abs/2210.08353
+        # https://github.com/liu-jc/MGNNI
+        # NOTE: The official code is only partial and thus cannot be executed
+        from MGNNI.nodeclassification.models_heterophilic import (
+            MGNNI_m_MLP as MGNNI)
+        net = MGNNI(
+            n_features, n_labels, args.hidden,
+            [1, 2], 3e-6, 300, 0.8,
+            fp_layer='EIGNN_M_att', dropout=args.dropout, batch_norm=True)
+        opt = Optim([*net.parameters()])
+        x = X.T
+        for epoch in range(1, 1 + args.max_epochs):
+            with opt:
+                z = net(x, adj)
+                criterion(z[train_mask], Y[train_mask]).mean().backward()
+            ev.record_training(opt.elapsed)
+            if ev.evaluate_result(sg(z)):
+                break
     else:
         # GNNs with Label (Label as Input & Label Reuse)
         # https://arxiv.org/abs/2103.13355
 
-        in_feats, x = n_features, X
+        in_feats, out_feats = n_features, n_labels
         if args.input_label:
-            in_feats += n_labels
-            state = torch.zeros((n_nodes, n_labels)).to(X.device)
+            state = torch.zeros((n_nodes, out_feats)).to(X.device)
+            in_feats += out_feats
             fwd_contracts = []
+            full_fwd_contracts = []
             bkd_contracts = []
+            fwd_counters = []
+            full_fwd_counters = []
+            bkd_counters = []
+            fwd_times = []
+            bkd_times = []
 
         if args.method in ('MLP', 'SGC'):
             net = gpu(gnn.MLP(
-                [in_feats, *([args.hidden] * (args.n_layers - 1)), n_labels],
+                [in_feats, *([args.hidden] * (args.n_layers - 1)), out_feats],
                 dropout=args.dropout))
             fwd = net.forward
             net.forward = lambda x, E: fwd(x)
         else:
             if args.method == 'JKNet':
-                net = JKNet(in_feats, n_labels, **args.__dict__)
+                net = JKNet(in_feats, out_feats, **args.__dict__)
             elif args.method == 'GCNII':
-                net = GCNII(in_feats, n_labels, **args.__dict__)
+                net = GCNII(in_feats, out_feats, **args.__dict__)
             elif args.method == 'GAT':
                 net = gnn.GAT(
-                    in_feats, args.hidden, args.n_layers, n_labels,
-                    args.dropout, heads=args.heads)
+                    in_feats, args.hidden, args.n_layers, out_feats,
+                    args.dropout, heads=args.heads, v2=True)
             else:
                 net = {
                     'GIN': gnn.GIN, 'GCN': gnn.GCN, 'SAGE': gnn.GraphSAGE
                 }[args.method](
                     in_feats, args.hidden, args.n_layers,
-                    n_labels, args.dropout)
+                    out_feats, args.dropout)
             net = gpu(net)
         opt = Optim([*net.parameters()])
 
+        input_label = args.input_label
+        if args.cache:
+            grad0 = state * 0
         for epoch in range(1, 1 + args.max_epochs):
             with opt:
-                with torch.no_grad():
-                    input_mask = sup_mask = train_mask
-                    input_y = train_y
-                    if args.input_label:
-                        mask_label = 1 - args.input_label
-                        if args.input_label > 1:
-                            mask_label = 0.5
-                            if fwd_contracts and fwd_contracts[-1]:
-                                mask_label = max(0.1, min(
-                                    0.9, fwd_contracts[-1] - exp))
-                        mask = torch.rand(n_nodes) < mask_label
+                if args.input_label:
+                    if epoch == 1 or args.input_label < 1:
+                        # Label Masking
+                        mask = torch.rand(n_nodes) < 1 - input_label
+                        im = torch.ones(n_nodes, 1).to(state.device)
+                        if not args.original_reuse:
+                            im[mask] = 0
                         input_mask = train_mask & ~mask
+                        im[input_mask] = 0
+                        iy = torch.zeros(state.shape).to(state.device)
+                        iy[input_mask] = train_y[input_mask[train_mask]]
                         sup_mask = train_mask & mask
-                        input_y = train_y[input_mask[train_mask]]
-                        # if not sup_mask.any().item():
-                        #     sup_mask = train_mask
-                        #     mask_label = 0
-                        state[:] = 0
+                        if args.input_label == 1:
+                            sup_mask = train_mask
+                        if input_label > 0 and not args.original_reuse:
+                            im /= input_label
+                            iy /= input_label
+                        if not args.cache:
+                            state[:] = 0
                         if args.for_iter:
+                            back_iter = args.for_iter
                             net.eval()
-                            last_dist = inf
-                            fwd_contracts.append(0)
-                            for _ in range(args.for_iter):
-                                last_state = state.clone()
-                                state[input_mask] = input_y
-                                if args.back_iter:
-                                    state[mask] = 0
-                                    state /= (1 - mask_label)
-                                state = sg(net(
-                                    torch.cat((X, state), dim=1), induc_E))
-                                # dist = (state - last_state).norm(2).item()
-                                dist = norm(state - last_state).item()
-                                if thres_for >= dist:
-                                    break
-                                fwd_contracts[-1] = max(
-                                    dist / last_dist, fwd_contracts[-1])
-                                last_dist = dist
-                                # Stop iterating if the mapping is expanding
-                                # NOTE: Only when using adaptive input_label to
-                                # avoid impacting ablation studies
-                                if (args.input_label > 1
-                                        and fwd_contracts[-1] - 1 > exp):
-                                    break
+                            with torch.no_grad():
+                                last_dist = inf
+                                fwd_contracts.append(0)
+                                t = time.time()
+                                for i in range(args.for_iter):
+                                    back_iter -= 1
+                                    last_state = state
+                                    state = sg(net(torch.cat((
+                                        X, state * im + iy), dim=1), induc_E))
+                                    dist = (
+                                        state - last_state).norm(inf).item()
+                                    if thres_for >= dist:
+                                        break
+                                    fwd_contracts[-1] = max(
+                                        dist / last_dist, fwd_contracts[-1])
+                                    last_dist = dist
+                                fwd_counters.append(i + 1)
+                                fwd_times.append(time.time() - t)
                             net.train()
 
-                    # Masked Label Strategy for Backward-pass
-                    if args.drop_state:
-                        drop_state = args.drop_state
-                        # Adaptively drop state wrt the contractive factor
-                        if args.drop_state >= 1:
-                            drop_state = 0.5
-                            if bkd_contracts and bkd_contracts[-1]:
-                                drop_state = max(0.1, min(
-                                    0.9, bkd_contracts[-1] - exp))
-                        mask = torch.rand(n_nodes) < drop_state
-                        sup_mask = train_mask & mask
-                        input_mask = train_mask & (~mask)
-                        input_y = train_y[input_mask[train_mask]]
-                        # if not sup_mask.any().item():
-                        #     sup_mask = train_mask
-                        #     drop_state = 0
-
-                    if args.input_label:
-                        state[input_mask] = input_y
-                        if args.back_iter:
-                            state[mask] = 0
-                            # Back propagate through masked sigmoid/softmax
-                            dsg = state * (1 - state)
-                            # NOTE: rescale factor should not be taped
-                            # because it simulates the sum of inputted
-                            # and masked states feeding to the next layer
-                            state /= (
-                                (1 - drop_state) if args.drop_state
-                                else (1 - mask_label))
-
-                # Training
-                if args.input_label:
                     if args.back_iter:
                         state.grad = None
                         state.requires_grad_(True)
-                    x = torch.cat((X, state), dim=1)
-                z = net(x, induc_E)
-                if args.back_iter:
-                    criterion(
-                        z[sup_mask], Y[sup_mask]
-                    ).mean().backward(retain_graph=True)
-                    # Implicit Differentiation
-                    last_vjpnorm = inf
-                    bkd_contracts.append(0)
-                    for _ in range(args.back_iter):
-                        state.grad, vjp = None, state.grad
-                        z.backward(vjp * dsg, retain_graph=True)
-                        # vjpnorm = vjp.norm(2).item()
-                        vjpnorm = norm(vjp).item()
-                        if thres_back >= vjpnorm:
-                            break
-                        bkd_contracts[-1] = max(
-                            vjpnorm / last_vjpnorm, bkd_contracts[-1])
-                        # Stop iterating if the mapping is expanding
-                        # NOTE: Only when using adaptive drop_state to
-                        # avoid impacting ablation studies
-                        if (args.drop_state >= 1
-                                and bkd_contracts[-1] - 1 > exp):
-                            break
-                        last_vjpnorm = vjpnorm
+                    x0 = state * im + iy
+                    if args.drop_state:
+                        mask = torch.rand(n_nodes) < args.drop_state
+                        dm = torch.ones(n_nodes, 1).to(state.device)
+                        dm[mask] = 0
+                        xm = torch.ones(n_nodes, 1).to(state.device)
+                        xm[torch.rand(n_nodes) < args.drop_features] = 0
+                        sup_mask = train_mask & mask
+                        x = torch.cat((
+                            X * xm / (1 - args.drop_features), 
+                            x0 * dm / (1 - args.drop_state)
+                        ), dim=1)
+                    else:
+                        x = torch.cat((X, x0), dim=1)
+                    z = net(x, induc_E)
+                    loss = criterion(z[sup_mask], Y[sup_mask])
+                    loss.mean().backward(retain_graph=True)
+
+                    if args.back_iter:
+                        # Implicit Differentiation
+                        if args.drop_state:
+                            z = net(torch.cat((X, x0), dim=1), induc_E)
+                        s = sg(z)
+                        if args.cache:
+                            s.retain_grad()
+                            s.backward(grad0, retain_graph=True)
+                            state.grad -= grad0
+                        last_vjpnorm = inf
+                        bkd_contracts.append(0)
+                        t = time.time()
+                        i = -1
+                        for i in range(
+                                back_iter if args.back_iter < 0
+                                else args.back_iter):
+                            vjp = state.grad
+                            if input_label > 0 and not args.original_reuse:
+                                vjp = input_label * vjp
+                            state.grad = None
+                            s.backward(vjp, retain_graph=True)
+                            vjpnorm = vjp.norm(inf).item()
+                            if thres_back >= vjpnorm:
+                                break
+                            bkd_contracts[-1] = max(
+                                vjpnorm / last_vjpnorm, bkd_contracts[-1])
+                            if args.terminate_back and bkd_contracts[-1] >= 1:
+                                break
+                            last_vjpnorm = vjpnorm
+                        if args.cache:
+                            grad0 = s.grad.clone()
+                        bkd_counters.append(i + 1)
+                        bkd_times.append(time.time() - t)
                 else:
-                    criterion(z[sup_mask], Y[sup_mask]).mean().backward()
+                    z = net(X, induc_E)
+                    criterion(z[train_mask], Y[train_mask]).mean().backward()
             ev.record_training(opt.elapsed)
 
             # Inference
@@ -911,78 +931,50 @@ for run in range(args.runs):
             with torch.no_grad():
                 net.eval()
                 if args.input_label:
-                    state[:] = 0
+                    if not args.cache:
+                        state[:] = 0
+                    tm = torch.ones(n_nodes, 1).to(state.device)
+                    tm[train_mask] = 0
+                    ty = torch.zeros(state.shape).to(state.device)
+                    ty[train_mask] = train_y
                     if args.for_iter:
                         last_dist = inf
-                        for _ in range(args.for_iter):
-                            last_state = state.clone()
-                            state[train_mask] = train_y
-                            state = sg(net(torch.cat((X, state), dim=1), E))
-                            dist = norm(state - last_state).item()
+                        full_fwd_contracts.append(0)
+                        back_iter = args.for_iter
+                        for i in range(args.for_iter):
+                            back_iter -= 1
+                            last_state = state
+                            state = sg(net(torch.cat((
+                                X, state * tm + ty), dim=1), E))
+                            dist = (state - last_state).norm(inf).item()
                             if thres_for >= dist:
                                 break
+                            full_fwd_contracts[-1] = max(
+                                dist / last_dist, full_fwd_contracts[-1])
                             last_dist = dist
-                    state[train_mask] = train_y
-                    x = torch.cat((X, state), dim=1)
+                        full_fwd_counters.append(i + 1)
+                    x = torch.cat((X, state * tm + ty), dim=1)
+                else:
+                    x = X
                 state = sg(net(x, E))
                 net.train()
             ev.record_evaluation(time.time() - t)
             if ev.evaluate_result(state):
                 break
 
+        traini = torch.tensor(ev.scores)[:, 0].argmax()
         if args.for_iter:
-            print('forward contracts:', fwd_contracts)
-            print('forward contract:',
-                  fwd_contracts[-args.early_stop_epochs - 1])
+            if args.input_label < 1:
+                print('forward iterations:', fwd_counters)
+                print('forward contracts:', fwd_contracts)
+                print('forward contract:', fwd_contracts[traini])
+            print('full forward iterations:', full_fwd_counters)
+            print('full forward contracts:', full_fwd_contracts)
+            print('full forward contract:', full_fwd_contracts[traini])
         if args.back_iter:
+            print('backward iterations:', bkd_counters)
             print('backward contracts:', bkd_contracts)
-            print('backward contract:',
-                  bkd_contracts[-args.early_stop_epochs - 1])
-
-    try:
-        with open(prs_fn, 'w') as file:
-            prs['settings'] = wocs
-            prs['date'] = str(datetime.datetime.now())
-            prs['run-%d' % run] = [ev.best_acc, ev.best_y.cpu().tolist()]
-            json.dump(prs, file)
-    except Exception:
-        pass
-
-    # Correct and Smooth
-    # https://arxiv.org/abs/2010.13993
-    if args.correct:
-        best_acc, best_y = ev.best_acc, ev.best_y
-        y = best_y
-        t = time.time()
-        true_err = train_y - y[train_mask]
-        err = torch.zeros(y.shape).to(y.device)
-        for _ in range(args.correct):
-            err[train_mask] = true_err
-            err = (1 - args.correct_rate) * err + args.correct_rate * (A @ err)
-            y = y + err
-            acc = get_score(
-                Y[valid_mask],
-                y[valid_mask] > 0 if is_multiclass
-                else y[valid_mask].argmax(dim=1))
-            if acc > best_acc:
-                best_acc, best_y = acc, y
-        ev.record_training(time.time() - t)
-        ev.evaluate_result(best_y)
-    if args.smooth:
-        best_acc, best_y = ev.best_acc, ev.best_y
-        y = best_y
-        t = time.time()
-        for _ in range(args.smooth):
-            y[train_mask] = train_y
-            y = (1 - args.smooth_rate) * y + args.smooth_rate * (A @ y)
-            acc = get_score(
-                Y[valid_mask],
-                y[valid_mask] > 0 if is_multiclass
-                else y[valid_mask].argmax(dim=1))
-            if acc > best_acc:
-                best_acc, best_y = acc, y
-        ev.record_training(time.time() - t)
-        ev.evaluate_result(best_y)
+            print('backward contract:', bkd_contracts[traini])
 
     ev.end_run()
 ev.end_all()
