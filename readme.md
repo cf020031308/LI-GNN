@@ -1,3 +1,8 @@
+Thank you for your interests on my research.
+
+This repo is no longer maintained because the corresponding manuscript is largely modified and accepted by *Neural Networks*.
+The newest version is at [https://github.com/cf020031308/LaE](https://github.com/cf020031308/LaE).
+
 # Label-inputted Implicit Graph Neural Network (LI-GNN)
 
 This repo contains code that are required to reporduce all experiments in our paper *Graph Equilibrium Networks: Unifying Label-inputted Graph Neural Networks with Deep Equilibrium Models*.
